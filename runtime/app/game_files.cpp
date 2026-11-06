@@ -97,7 +97,11 @@ bool FindGame(GameFiles& game) {
     };
 
     std::vector<uint8_t> xbe;
-    if (!assets.empty() && ReadHostFile(assets / IMAGE_XBE, xbe) && consider(assets, std::move(xbe), nullptr)) return true;
+    // an xbe beside a disc image and no folders of the game's files is the copy a build recompiles from: the image is the game
+    bool extracted = isos.empty();
+    if (!assets.empty())
+        for (auto& e : fs::directory_iterator(assets, ec)) extracted = extracted || e.is_directory(ec);
+    if (!assets.empty() && extracted && ReadHostFile(assets / IMAGE_XBE, xbe) && consider(assets, std::move(xbe), nullptr)) return true;
     for (const fs::path& iso : isos) {
         auto disc = std::make_unique<kernel::Disc>();
         std::string error;

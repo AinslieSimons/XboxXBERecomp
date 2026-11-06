@@ -60,6 +60,18 @@ void RemovePad(SDL_JoystickID id) {
 }
 
 // once a millisecond at most, however many ports and threads read
+#ifdef __APPLE__
+// the main thread pumps SDL's events (Cocoa allows nothing else) and hands the controllers' on
+}  // namespace
+void HandleSdlEvent(const SDL_Event& e) {
+    if (e.type != SDL_EVENT_GAMEPAD_ADDED && e.type != SDL_EVENT_GAMEPAD_REMOVED) return;
+    std::lock_guard lock(g_lock);
+    if (e.type == SDL_EVENT_GAMEPAD_ADDED) AddPad(e.gdevice.which);
+    else RemovePad(e.gdevice.which);
+}
+namespace {
+void UpdatePads() {}
+#else
 void UpdatePads() {
     static uint64_t last = 0;
     uint64_t now = SDL_GetTicks();
@@ -72,6 +84,7 @@ void UpdatePads() {
         else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) RemovePad(e.gdevice.which);
     }
 }
+#endif
 
 }  // namespace
 

@@ -110,7 +110,11 @@ void NameHostThread(const char* name) {
     static Fn set = reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")));
     if (set) set(GetCurrentThread(), w);
 #else
+#ifdef __APPLE__
+    pthread_setname_np(name);  // this thread's own name only
+#else
     pthread_setname_np(pthread_self(), name);
+#endif
 #endif
 }
 

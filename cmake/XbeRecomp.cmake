@@ -20,6 +20,10 @@ set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
 set(SDL_RENDER OFF CACHE BOOL "" FORCE)
 set(SDL_GPU OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
+if(APPLE)
+    enable_language(OBJC OBJCXX)
+    set(SDL_METAL ON CACHE BOOL "" FORCE)
+endif()
 FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL.git GIT_TAG release-3.4.16 GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(zydis tomlplusplus imgui SDL3)
 
@@ -91,6 +95,63 @@ file(GLOB XBE_RUNTIME_SOURCES CONFIGURE_DEPENDS ${XBE_SDK_DIR}/runtime/*/*.cpp)
 # SDL's headers go to the input code alone (it is linked LINK_ONLY), so the generated sources' compile line stays the same
 set_source_files_properties(${XBE_SDK_DIR}/runtime/core/input.cpp PROPERTIES INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
 
+# macOS: SDL window and audio, Metal, the game's code linked into the executable
+function(add_xbe_image_mac target xbe config partitions game_dir)
+    set(GEN ${CMAKE_CURRENT_SOURCE_DIR}/generated/${game_dir})
+    set(GEN_SOURCES ${GEN}/x86_func_mapping.cpp)
+    math(EXPR last "${partitions} - 1")
+    foreach(i RANGE ${last})
+        list(APPEND GEN_SOURCES ${GEN}/x86_recomp.${i}.cpp)
+    endforeach()
+    file(GLOB configs CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/config/*.toml ${XBE_SDK_DIR}/xdk/*/*.toml)
+    add_custom_command(
+        OUTPUT ${GEN}/codegen.stamp
+        BYPRODUCTS ${GEN_SOURCES} ${GEN}/x86_recomp_shared.h ${GEN}/image_symbols.h
+        COMMAND xbe_recomp config/${config} --xdk ${XBE_SDK_DIR}/xdk
+        COMMAND ${CMAKE_COMMAND} -E touch ${GEN}/codegen.stamp
+        DEPENDS xbe_recomp ${configs} ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xbe}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT "Recompiling ${xbe}"
+        VERBATIM)
+    add_custom_target(recompile_${target} DEPENDS ${GEN}/codegen.stamp)
+    set_source_files_properties(${GEN_SOURCES} PROPERTIES GENERATED TRUE
+        COMPILE_OPTIONS "-O2;-w;-fno-strict-aliasing;-ffp-contract=off")
+    file(GLOB GAME_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/${game_dir}/*.cpp)
+    set(xbe_file ${CMAKE_CURRENT_SOURCE_DIR}/assets/${xbe})
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${xbe_file})
+    file(SHA1 ${xbe_file} xbe_sha1)
+    set(XBE_HASH ${CMAKE_CURRENT_BINARY_DIR}/${target}_xbe.cpp)
+    # what shaders are made from: the shader cache's records last until one of these changes (gpu/metal.mm)
+    set(shader_sources)
+    foreach(f gpu/shaders.cpp gpu/shaders.h gpu/msl.cpp gpu/vertex.cpp gpu/vertex.h gpu/d3d_common.cpp gpu/d3d_common.h gpu/state.h)
+        list(APPEND shader_sources ${XBE_SDK_DIR}/runtime/${f})
+    endforeach()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${shader_sources})
+    set(shader_hashes "")
+    foreach(f ${shader_sources})
+        file(SHA1 ${f} one)
+        string(APPEND shader_hashes ${one})
+    endforeach()
+    string(SHA1 shader_hash "${shader_hashes}")
+    file(CONFIGURE OUTPUT ${XBE_HASH} CONTENT "extern const char kImageSha1[] = \"${xbe_sha1}\";\nextern const char kShaderSourceHash[] = \"${shader_hash}\";\n")
+    set(RUNTIME ${XBE_RUNTIME_SOURCES})
+    list(FILTER RUNTIME EXCLUDE REGEX "/gpu/d3d1[12]\\.cpp$|/audio/xaudio2\\.cpp$|/core/wheel\\.cpp$|/app/(main|game_code|splash|handover|screenshot|system_info)\\.cpp$")
+    file(GLOB MAC_SOURCES CONFIGURE_DEPENDS ${XBE_SDK_DIR}/runtime/mac/*.mm ${XBE_SDK_DIR}/runtime/gpu/*.mm)
+    add_executable(${target} ${RUNTIME} ${MAC_SOURCES} ${XBE_HOST_SOURCES} ${GAME_SOURCES} ${GEN_SOURCES} ${XBE_HASH}
+        ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm)
+    add_dependencies(${target} recompile_${target})
+    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${XBE_SDK_DIR}/runtime ${GEN} ${XBE_SDK_DIR}/runtime/mac/compat)
+    target_include_directories(${target} SYSTEM PRIVATE ${imgui_SOURCE_DIR})
+    set_source_files_properties(${MAC_SOURCES} ${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    set_source_files_properties(${MAC_SOURCES} PROPERTIES INCLUDE_DIRECTORIES "${sdl3_SOURCE_DIR}/include")
+    target_compile_options(${target} PRIVATE -fno-strict-aliasing -ffp-contract=off)
+    target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus SDL3::SDL3-static
+        "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework CoreGraphics"
+        "-framework ImageIO" "-framework CoreServices" "-framework Cocoa")
+endfunction()
+
 # One executable per recompiled image: its code from config/<config> (partitions as that config sets them),
 # the SDK runtime, XBE_HOST_SOURCES shared by every image of the game, and src/<game_dir> hooks only this image has.
 function(add_xbe_image_dll target xbe config partitions game_dir)
@@ -152,6 +213,10 @@ endfunction()
 
 # Expects assets/<xbe> and the config's out = "generated/<game_dir>". At run time the game may be a disc image instead.
 function(add_xbe_image target xbe config partitions game_dir)
+    if(APPLE)
+        add_xbe_image_mac(${target} ${xbe} ${config} ${partitions} ${game_dir})
+        return()
+    endif()
     if(XBE_GAME_DLL)
         add_xbe_image_dll(${target} ${xbe} ${config} ${partitions} ${game_dir})
         return()

@@ -16,7 +16,9 @@
 #define NOMINMAX
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace mem {
@@ -25,6 +27,13 @@ static uint8_t* g_base = nullptr;
 static std::recursive_mutex g_lock;
 
 uint8_t* Base() { return g_base; }
+
+#ifndef _WIN32
+static uint64_t HostPage() {
+    static const uint64_t page = uint64_t(sysconf(_SC_PAGESIZE));
+    return page;
+}
+#endif
 
 // physical memory shows at 0x80000000 and again at 0xF0000000 (write combined view), the host's part included
 static bool InPhysical(uint32_t va) {
@@ -61,7 +70,15 @@ bool Init() {
 #else
     void* p = mmap(reinterpret_cast<void*>(0x100000000ull), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     g_base = p == MAP_FAILED ? nullptr : static_cast<uint8_t*>(p);
+#ifdef __APPLE__
+    // no memfd: a POSIX shared memory object, unlinked at once, is the same anonymous file
+    std::string shm_name = "/xbe_ram_" + std::to_string(getpid());
+    shm_unlink(shm_name.c_str());
+    int fd = g_base ? shm_open(shm_name.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600) : -1;
+    if (fd >= 0) shm_unlink(shm_name.c_str());
+#else
     int fd = g_base ? memfd_create("ram", 0) : -1;
+#endif
     if (fd < 0 || ftruncate(fd, kMappedPhysical) ||
         mmap(g_base + kContiguousBase, kMappedPhysical, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED ||
         mmap(g_base + kWriteCombineBase, kMappedPhysical, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED)
@@ -89,7 +106,10 @@ bool Commit(uint32_t va, uint32_t size) {
         return false;
     }
 #else
-    if (mprotect(g_base + first, size_t(end - first), PROT_READ | PROT_WRITE)) {
+    // a host page may be bigger than the guest's 4 KB (16 KB on Apple silicon): protect whole host pages
+    const uint64_t hp = HostPage();
+    const uint64_t hfirst = first & ~(hp - 1), hend = (end + hp - 1) & ~(hp - 1);
+    if (mprotect(g_base + hfirst, size_t(hend - hfirst), PROT_READ | PROT_WRITE)) {
         LOGE("memory: commit %08X+%X failed", first, uint32_t(end - first));
         return false;
     }
@@ -106,8 +126,21 @@ void Decommit(uint32_t va, uint32_t size) {
 #ifdef _WIN32
     VirtualFree(g_base + first, size_t(end - first), MEM_DECOMMIT);
 #else
-    madvise(g_base + first, size_t(end - first), MADV_DONTNEED);
-    mprotect(g_base + first, size_t(end - first), PROT_NONE);
+    for (uint64_t p = first; p < end; p += kPage) g_committed[size_t(p >> 12)] = 0;
+    // Host pages can hold other guest pages that are still committed. Those stay mapped, and the guest pages decommitted
+    // in them are cleared by hand; the rest are replaced by fresh pages (madvise does not promise zeros on macOS).
+    const uint64_t hp = HostPage();
+    for (uint64_t h = first & ~(hp - 1); h < end; h += hp) {
+        bool busy = false;
+        for (uint64_t p = h; p < h + hp; p += kPage) busy = busy || (p < (1ull << 32) && g_committed[size_t(p >> 12)]);
+        if (!busy) {
+            mmap(g_base + h, size_t(hp), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+            continue;
+        }
+        const uint64_t a = std::max<uint64_t>(h, first), b = std::min<uint64_t>(h + hp, end);
+        std::memset(g_base + a, 0, size_t(b - a));
+    }
+    return;
 #endif
     for (uint64_t p = first; p < end; p += kPage) g_committed[size_t(p >> 12)] = 0;
 }

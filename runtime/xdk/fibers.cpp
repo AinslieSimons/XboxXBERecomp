@@ -16,8 +16,19 @@
 #define NOMINMAX
 #include <windows.h>
 #else
+#ifdef __APPLE__
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700  // the header refuses the ucontext routines without it
+#endif
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE
+#endif
+#endif
 #include <sys/mman.h>
 #include <ucontext.h>
+#ifndef MAP_STACK
+#define MAP_STACK 0
+#endif
 #endif
 
 using namespace kernel;

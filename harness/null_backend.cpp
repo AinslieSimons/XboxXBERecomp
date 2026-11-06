@@ -42,6 +42,10 @@ public:
     }
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override {
         draws_++;
+        if (g_draw_filter && !drawing_) {  // a title's filter sees every draw, as under a real renderer
+            DrawAdjust adjust;
+            g_draw_filter(s, adjust);
+        }
         if (drawing_) reference::Draw(s, prim, start, count, indices);
         if (list_) List(s, prim, start, count);
         harness::AuditDraw(s, prim, start, count, indices);

@@ -28,6 +28,9 @@
 #include "core/log.h"
 
 namespace app {
+#ifdef __APPLE__
+std::vector<Mode> MacModes();  // mac/main.mm
+#endif
 
 namespace {
 
@@ -318,6 +321,9 @@ void Note(const char* text) {
     ImGui::PopStyleColor();
 }
 
+#ifdef __APPLE__
+std::vector<Mode> Modes() { return app::MacModes(); }
+#else
 // the monitor's modes, widest first, each size once
 std::vector<Mode> Modes() {
     std::vector<Mode> modes;
@@ -338,6 +344,8 @@ std::vector<Mode> Modes() {
     });
     return modes;
 }
+
+#endif
 
 void Display(Settings& s) {
     bool changed = false;
@@ -860,14 +868,22 @@ bool OverlayKey(uint16_t vk) {
 void OverlayInit() {
     ImGuiIO& io = ImGui::GetIO();
     // Tahoma, as classic Steam, at the size the desktop's height wants; the default font on a machine without it
+#ifdef __APPLE__
+    const std::filesystem::path fonts = "/System/Library/Fonts/Supplemental";
+    const char* regular = "Tahoma.ttf";
+    const char* bold = "Tahoma Bold.ttf";
+#else
     wchar_t dir[MAX_PATH];
     UINT len = GetWindowsDirectoryW(dir, MAX_PATH);
     std::filesystem::path fonts = std::filesystem::path(std::wstring(dir, len)) / L"Fonts";
+    const wchar_t* regular = L"tahoma.ttf";
+    const wchar_t* bold = L"tahomabd.ttf";
+#endif
     float px = std::round(kBaseFont * std::max(1.0f, float(Desktop().height) / 720.0f));
     std::error_code ec;
-    if (std::filesystem::exists(fonts / L"tahoma.ttf", ec)) io.Fonts->AddFontFromFileTTF((fonts / L"tahoma.ttf").string().c_str(), px);
+    if (std::filesystem::exists(fonts / regular, ec)) io.Fonts->AddFontFromFileTTF((fonts / regular).string().c_str(), px);
     if (io.Fonts->Fonts.empty()) io.Fonts->AddFontDefault();
-    if (std::filesystem::exists(fonts / L"tahomabd.ttf", ec)) g_bold = io.Fonts->AddFontFromFileTTF((fonts / L"tahomabd.ttf").string().c_str(), px);
+    if (std::filesystem::exists(fonts / bold, ec)) g_bold = io.Fonts->AddFontFromFileTTF((fonts / bold).string().c_str(), px);
 }
 
 namespace {

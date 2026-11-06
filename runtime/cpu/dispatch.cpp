@@ -24,7 +24,9 @@
 #ifdef _WIN32
 #include <intrin.h>
 #else
+#if defined(__x86_64__)
 #include <x86intrin.h>
+#endif
 #endif
 
 #ifdef XBE_GAME_DLL

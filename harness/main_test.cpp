@@ -3,7 +3,11 @@
 #include <chrono>
 #include <csignal>
 #include <execinfo.h>
+#ifdef __APPLE__
+#include <sys/ucontext.h>
+#else
 #include <ucontext.h>
+#endif
 #include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
@@ -26,9 +30,14 @@
 void OnCrash(int sig, siginfo_t* info, void* uc) {
     char line[160];
     auto* ctx = static_cast<ucontext_t*>(uc);
+#if defined(__APPLE__) && defined(__aarch64__)
+    int n = std::snprintf(line, sizeof line, "crash: signal %d at %p, pc %llx, x0 %llx\n", sig, info->si_addr,
+                          (unsigned long long)ctx->uc_mcontext->__ss.__pc, (unsigned long long)ctx->uc_mcontext->__ss.__x[0]);
+#else
     int n = std::snprintf(line, sizeof line, "crash: signal %d at %p, rip %llx, guest esp (rdi+16) %08x\n", sig, info->si_addr,
                           (unsigned long long)ctx->uc_mcontext.gregs[REG_RIP],
                           ctx->uc_mcontext.gregs[REG_RDI] ? *reinterpret_cast<const uint32_t*>(ctx->uc_mcontext.gregs[REG_RDI] + 16) : 0u);
+#endif
     if (n > 0) (void)!write(2, line, size_t(n));
     void* frames[32];
     backtrace_symbols_fd(frames, backtrace(frames, 32), 2);
