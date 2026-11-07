@@ -57,6 +57,7 @@ Environment:
   sampled into `cap/textures.txt` with how far each mip level is from its parent shrunk (`audit.cpp`)
 - `PROBES="x,y x,y"` log every colour the reference renderer writes at those pixels of linear `PROBE_WIDTH` (640) wide
   targets; `TRACE="x,y"` logs the combiner registers there
+- `REF_FLAT` with `REF_DRAWLOG`: each draw's box of stream 0 positions, for finding level surfaces such as water
 - `FPS=N` presents at most N frames a second, `FPS=0` unpaced; without it the settings' `fps_cap` (a game's
   `init` may set it), 60 when that is 0; within that, the title's present interval (`D3D_PresentInterval`): 60 a
   second over the number of vertical blanks it asks for

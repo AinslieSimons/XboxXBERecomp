@@ -1784,14 +1784,13 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
     // a linear texture's too: its texel coordinates are over the guest's size (texsize), whatever the picture's
     if (!d.cube && d.depth == 1 && !fi.depth) {
         auto r = FindReplacement(d.data);
-        if (r && ((r->sharpened && !(r->world ? app::Get().world_textures : app::Get().sharp_2d)) || !ReplacementFits(*r, d))) r = nullptr;
+        if (r && ((r->sharpened && !app::Get().sharp_2d) || !ReplacementFits(*r, d))) r = nullptr;
         if (ID3D12Resource* res = r ? BindReplacement(*r, d, stages.sv[stage]) : nullptr) {
             stages.replaced[stage] = true;
             return res;
         }
     }
     if (draw_2d_) Sharpen2D(d);
-    else SharpenWorld(d, s.tss[size_t(stage)][kTssAddressU] == 1, s.tss[size_t(stage)][kTssAddressV] == 1);
     StagePalette palette;
     ReadStagePalette(s, stage, d, palette);
     const uint64_t key = uint64_t(palette.va) << 32 | d.data;
@@ -2492,8 +2491,15 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         return;
     }
     DrawAdjust adjust;
-    if (g_draw_filter) g_draw_filter(s, adjust);
+    adjust.start = start, adjust.count = count, adjust.indices = indices;
+    if (g_draw_filter && !g_draw_filtered) g_draw_filter(s, adjust);
     if (adjust.skip) return;
+    if (adjust.stage3) {
+        g_draw_filtered = true;
+        Draw(*WithStage3(s, adjust.stage3), prim, start, count, indices);
+        g_draw_filtered = false;
+        return;
+    }
     DrawEnd draw_end{ext_};
     if (ext_) ext_->BeginDraw(s);
     Assembled& a = asm_;

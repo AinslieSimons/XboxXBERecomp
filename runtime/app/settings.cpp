@@ -230,7 +230,6 @@ void Load() {
     s.smaa = t["smaa"].value_or(s.smaa);
     s.scale_filter = t["scale_filter"].value_or(s.scale_filter);
     s.alpha_coverage = t["alpha_coverage"].value_or(s.alpha_coverage);
-    s.world_textures = t["world_textures"].value_or(s.world_textures);
     s.low_latency = t["low_latency"].value_or(s.low_latency);
     s.sharpen = std::min<uint32_t>(t["sharpen"].value_or(s.sharpen), 100);
     std::string renderer = t["renderer"].value_or(std::string(kRenderers[s.renderer % kRendererCount]));
@@ -324,7 +323,6 @@ toml::table Table() {
                   {"smaa", s.smaa},
                   {"scale_filter", int64_t(s.scale_filter)},
                   {"alpha_coverage", s.alpha_coverage},
-                  {"world_textures", s.world_textures},
                   {"low_latency", s.low_latency},
                   {"sharpen", int64_t(s.sharpen)},
                   {"renderer", kRenderers[s.renderer % kRendererCount]},

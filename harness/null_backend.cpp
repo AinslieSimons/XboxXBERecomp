@@ -44,6 +44,7 @@ public:
         draws_++;
         if (g_draw_filter && !drawing_) {  // a title's filter sees every draw, as under a real renderer
             DrawAdjust adjust;
+            adjust.start = start, adjust.count = count, adjust.indices = indices;
             g_draw_filter(s, adjust);
         }
         if (drawing_) reference::Draw(s, prim, start, count, indices);

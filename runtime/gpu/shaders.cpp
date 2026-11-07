@@ -459,6 +459,9 @@ std::string TexFetch(const PixelKey& k, int i) {
             s += F("float3 nrm%d = float3(dp%d, dp%d, dp%d), eye%d = float3(tc%d.w, tc%d.w, tc%d.w);\n", i, i - 2, i - 1, i, i, i - 2,
                    i - 1, i);
             s += F("float3 refl%d = 2 * nrm%d * dot(nrm%d, eye%d) / dot(nrm%d, nrm%d) - eye%d;\n", i, i, i, i, i, i, i);
+            // a 2D texture here is no console draw's: a game's planar reflection, read at the pixel's own place on the screen and
+            // bent by the normal
+            if (t.kind == kTex2D) return s + put(F("planar(tex%d, smp%d, i.pos.xy, nrm%d)", i, i, i));
             return s + put(sample3(F("refl%d", i)));
         case 0xD:
         case 0xE: return dp(i, i, dm, in) + put(sample3(F("float3(dp%d, dp%d, dp%d)", i - 2, i - 1, i)));
@@ -478,6 +481,13 @@ float4 depthbytes(float d, int order) {
     uint v = uint(saturate(d) * 16777215.0 + 0.5);
     float hi = float(v >> 16) / 255.0, mid = float((v >> 8) & 255) / 255.0, lo = float(v & 255) / 255.0;
     return order == 1 ? float4(0, lo, mid, hi) : order == 2 ? float4(lo, mid, hi, 0) : float4(mid, lo, 0, hi);
+}
+// a planar reflection the size of the target, at this pixel, bent by the normal's lean
+float4 planar(Texture2D img, SamplerState s, float2 pos, float3 n) {
+    float2 size;
+    img.GetDimensions(size.x, size.y);
+    float2 lean = normalize(n).xz;
+    return img.Sample(s, saturate(pos / size + lean * float2(0.15, 0.4)));
 }
 float4 spreadtap(Texture2D t, SamplerState s, float2 uv, float4 w, float m) {
     float4 c = 0;

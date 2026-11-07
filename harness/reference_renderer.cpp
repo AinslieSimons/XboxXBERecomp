@@ -501,6 +501,7 @@ enum Attr { kD0, kD1, kB0, kB1, kFog, kT0, kAttrs = kT0 + 4 };
 struct Fragment {
     Vec v0, v1, fog;  // fog: colour, amount in w
     Vec tc[4];
+    int x = 0, y = 0;  // on the target
 };
 
 // what every fragment of a draw shares
@@ -633,6 +634,12 @@ struct Combiners {
             case 0xC: {  // reflect specular at stage 3: eye from the three w
                 dot();
                 Vec n = V(dp[i - 2], dp[i - 1], dp[i], 0), eye = V(f.tc[i - 2][3], f.tc[i - 1][3], f.tc[i][3], 0);
+                if (info.kind == kTex2D && u0.img) {  // a game's planar reflection: gpu/shaders.cpp planar()
+                    float len = std::sqrt(Dot3(n, n));
+                    float pu = std::clamp((f.x + 0.5f) / u0.img->w + n[0] / len * 0.15f, 0.f, 1.f), pv = std::clamp((f.y + 0.5f) / u0.img->h + n[2] / len * 0.4f, 0.f, 1.f);
+                    t[i] = u0.Sample(0, pu, pv);
+                    break;
+                }
                 float nn = Dot3(n, n), ne = Dot3(n, eye);
                 Vec r;
                 for (int j = 0; j < 3; j++) r[j] = 2 * n[j] * ne / nn - eye[j];
@@ -1114,6 +1121,17 @@ void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t rects
 }
 
 void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
+    // first: a filter may change what the draw reads, and the material below is built from it
+    DrawAdjust adjust;
+    adjust.start = start, adjust.count = count, adjust.indices = indices;
+    if (g_draw_filter && !g_draw_filtered) g_draw_filter(s, adjust);
+    if (adjust.skip) return;
+    if (adjust.stage3) {
+        g_draw_filtered = true;
+        Draw(*WithStage3(s, adjust.stage3), prim, start, count, indices);
+        g_draw_filtered = false;
+        return;
+    }
     if (const State* sprites = PointSpriteStages(s, prim)) return Draw(*sprites, prim, start, count, indices);
     if (s.blank_format && s.textures[0] && (::kernel::R32(s.textures[0] + 12) >> 8 & 0xFF) == s.blank_format) {
         Clear(s, 0, nullptr, 0xF0, 0xFF000000u, 0, 0);  // a black clear in its place (State::blank_format)
@@ -1371,6 +1389,27 @@ void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const u
         as.indices = std::move(idx);
     }
 
+    // REF_FLAT with REF_DRAWLOG: each draw's box of stream 0 positions (float3 at v0), for finding level surfaces such as water
+    static const bool flat_log = std::getenv("REF_FLAT") != nullptr;
+    if (g_drawlog && flat_log && s.vs && s.streams[0].vb && count >= 3 && s.vs->inputs[0].stream == 0 && s.vs->inputs[0].type == 0x32) {
+        const uint32_t vb = mem::VirtualFromPhysical(kernel::R32(s.streams[0].vb + 4)), stride = s.streams[0].stride, at = s.vs->inputs[0].offset;
+        float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+        for (uint32_t i = 0; i < count; i++) {
+            const uint32_t v = indices ? (uint32_t(indices[i * 2]) | uint32_t(indices[i * 2 + 1]) << 8) + s.base_vertex : start + i;
+            for (uint32_t c = 0; c < 3; c++) {
+                const uint32_t bits = kernel::R32(vb + v * stride + at + c * 4);
+                float f;
+                std::memcpy(&f, &bits, 4);
+                lo[c] = std::min(lo[c], f);
+                hi[c] = std::max(hi[c], f);
+            }
+        }
+        TextureDesc d0, d1;
+        const uint32_t t0 = s.textures[0] && Describe(s.textures[0], d0) ? d0.data : 0, t1 = s.textures[1] && Describe(s.textures[1], d1) ? d1.data : 0;
+        std::fprintf(g_drawlog, "FLAT vs %08X ps %08X modes %X rt %08X vp %ux%u n %u t0 %08X t1 %08X x %.2f %.2f y %.3f %.3f z %.2f %.2f blend %u %X %X\n", s.vs_handle, s.ps ? s.ps->handle : 0, s.rs[kRsPsTextureModes], s.rt.data, s.viewport.w, s.viewport.h, count, t0, t1,
+                     lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], s.simple[kMBlendEnable >> 2], s.simple[kMSrcBlend >> 2], s.simple[kMDestBlend >> 2]);
+    }
+
     // REF_VERTS_VS=handle with REF_DRAWLOG: that vertex shader's vertices listed (input v0, screen position)
     static const uint32_t verts_vs = uint32_t(std::strtoul(std::getenv("REF_VERTS_VS") ? std::getenv("REF_VERTS_VS") : "0", nullptr, 16));
     static const uint32_t verts_t0 = uint32_t(std::strtoul(std::getenv("REF_VERTS_T0") ? std::getenv("REF_VERTS_T0") : "0", nullptr, 16));
@@ -1417,9 +1456,6 @@ void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const u
     // REF_NODEPTH_VS=handle (experiment): that vertex shader's draws without the depth test
     static const uint32_t nodepth = uint32_t(std::strtoul(std::getenv("REF_NODEPTH_VS") ? std::getenv("REF_NODEPTH_VS") : "0", nullptr, 16));
     if (nodepth && s.vs_handle == nodepth) ztest = zwrite = false;
-    DrawAdjust adjust;
-    if (g_draw_filter) g_draw_filter(s, adjust);
-    if (adjust.skip) return;
     if (!adjust.depth_test && !std::getenv("REF_ZOWNER")) ztest = zwrite = false;  // REF_ZOWNER measures with it
     static const bool track_owner = std::getenv("REF_ZOWNER") != nullptr;
     uint32_t zfunc = simple(kMZFunc);
@@ -1569,6 +1605,7 @@ void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const u
                         for (int j = 0; j < 4; j++) attr[a][j] = (b0 * p0.attr[a][j] + b1 * p1.attr[a][j] + b2 * p2.attr[a][j]) / iw;
                     if (flat) std::copy(flat_colour, flat_colour + 4, attr);
                     Fragment frag;
+                    frag.x = x, frag.y = y;
                     bool back = two_sided && !front;
                     frag.v0 = attr[back ? kB0 : kD0];
                     frag.v1 = attr[back ? kB1 : kD1];

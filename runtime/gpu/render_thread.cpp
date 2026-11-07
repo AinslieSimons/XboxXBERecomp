@@ -44,7 +44,7 @@ constexpr uint32_t kMergedIndices = 1u << 13;
 
 // resource headers the render thread reads: common, data, lock, format, size
 constexpr uint32_t kHeaderBytes = 20, kHeaderSlot = 32;
-constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a copy is renewed after half a ring
+constexpr uint32_t kHeaderRing = 16u << 20;  // guest memory for header copies; a copy is renewed after half a ring. Must outlast the frames queued: at 1 MB a city drawn twice wrapped it, and draws read other textures
 
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 

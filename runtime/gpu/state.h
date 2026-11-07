@@ -246,8 +246,22 @@ struct DrawAdjust {
     bool depth_test = true;
     bool skip = false;
     int32_t depth_bias = 0;  // added to the polygon offset, in 24 bit depth units; negative draws nearer
+    // the draw, for a filter that reads its vertices: indices (16 bit, base_vertex added) or from start, count of them
+    uint32_t start = 0, count = 0;
+    const uint8_t* indices = nullptr;
+    uint32_t stage3 = 0;  // a guest texture in place of stage 3's, for this draw alone
 };
 using DrawFilter = void (*)(const State&, DrawAdjust&);
 inline DrawFilter g_draw_filter = nullptr;
+// a draw with DrawAdjust::stage3 goes through the backend again with this copy of its state, and no second filter
+inline thread_local bool g_draw_filtered = false;
+inline const State* WithStage3(const State& s, uint32_t texture) {
+    thread_local std::unique_ptr<State> t;
+    if (!t) t = std::make_unique<State>();
+    *t = s;
+    t->textures[3] = texture;
+    t->palettes[3] = 0;
+    return t.get();
+}
 
 }  // namespace gpu
