@@ -36,8 +36,13 @@ const char* kAspects[] = {"auto", "4:3", "16:9", "screen"};
 constexpr uint32_t kAspectCount = 4;
 const char* kMsaa[] = {"off", "msaa2", "msaa4", "msaa8"};
 constexpr uint32_t kMsaaCount = 4;
+#ifdef __APPLE__
+const char* kRenderers[] = {"metal"};  // the only one; a file from Windows naming d3d12 or d3d11 reads as it
+constexpr uint32_t kRendererCount = 1;
+#else
 const char* kRenderers[] = {"d3d12", "d3d11"};
 constexpr uint32_t kRendererCount = 2;
+#endif
 
 // the displays in Windows' order
 #ifdef _WIN32
