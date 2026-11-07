@@ -1892,7 +1892,11 @@ id<MTLSamplerState> MetalBackend::Sampler(const D3D12_SAMPLER_DESC& sd) {
     m.lodMinClamp = sd.MinLOD;
     m.lodMaxClamp = std::max(sd.MinLOD, sd.MaxLOD);
     if (f & 0x80) m.compareFunction = CompareOf(sd.ComparisonFunc);
-    if (sd.MipLODBias != 0) LOG_FIRST(1, "metal: a sampler's LOD bias is not applied (%g)", sd.MipLODBias);
+    // the title's bias (PGR2's city textures mostly -1), as D3D applies it; before macOS 26 a sampler has none
+    if (sd.MipLODBias != 0) {
+        if (@available(macOS 26.0, *)) m.lodBias = std::clamp(sd.MipLODBias, -16.0f, 15.999f);
+        else LOG_FIRST(1, "metal: a sampler's LOD bias is not applied before macOS 26 (%g)", sd.MipLODBias);
+    }
     return samplers_[h] = [dev_ newSamplerStateWithDescriptor:m];
 }
 
