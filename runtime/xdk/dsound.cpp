@@ -225,6 +225,19 @@ struct Voice {
     bool is3d = false;
     uint32_t mode = 0;  // DS3DMODE: 1 head relative, 2 disabled
     float p[3] = {}, min_dist = 1, max_dist = 1e9f;
+    // SetFilter's low pass (DSFILTER_MODE_DLS2, or MULTI's first section), a state variable filter. Once set it keeps
+    // running: its tuning (g, k) glides to the title's and its output fades in and out (mix), as steps in either click
+    bool filtered = false;                // SetFilter has turned it on at some time
+    float lp_g = 0, lp_k = 1, lp_g_to = 0, lp_k_to = 1;
+    float lp_mix = 0, lp_mix_to = 0;      // 0 the voice as it is, 1 filtered
+    float lp_s[6][2] = {};
+    // Levels change between the mixer's blocks, so a voice starting, stopping or moving its level at once steps the
+    // waveform at a block's first sample, which crackles when many loud effects come and go (live, 1024 frame blocks).
+    // The APU ramps such changes; here a voice glides from the levels it was mixed at last (g_was, mixed_in), a new one
+    // fades in over kFadeIn frames and a stopped buffer plays on, fading, for tail frames.
+    float g_was[6][2] = {};
+    uint64_t mixed_in = 0;  // the block it was last mixed in (0: none)
+    uint32_t tail = 0;
     // ADPCM block cache
     int64_t block = -1;
     int16_t decoded[65 * 8];
@@ -332,6 +345,17 @@ void Levels(Voice& v, float g[kMixChannels][2]) {
     // an audible speaker bin: the effect sends are left out (their effects are not modelled). With none, the sends stand
     // in for what the effects would put out: PGR2's radio goes to FXSEND 14 alone, its speaker bins at -10000, and the
     // DSP image plays it into the speakers. Heard dry, left and right kept, at the title's send_level (app.h).
+    // XBE_DSOUND_MUTE_BIN=b (testing): a voice sending to mix bin b is not heard (24: PGR2's race radio)
+    static const int mute_bin = [] {
+        const char* e = std::getenv("XBE_DSOUND_MUTE_BIN");
+        return e && *e ? std::atoi(e) : -1;
+    }();
+    if (mute_bin >= 0 && v.nbins)
+        for (uint32_t s = 0; s < n; s++)
+            if (bin[s] == mute_bin && v.bin_mb[bin[s]] > -10000) {
+                std::memset(g, 0, sizeof(float) * kMixChannels * 2);
+                return;
+            }
     bool speakers = false;
     for (uint32_t s = 0; s < n; s++) speakers |= bin[s] < 10 && bin[s] != 3 && (!v.nbins || v.bin_mb[bin[s]] > -10000);
     const bool sends_stereo = !speakers && channels == 2;
@@ -381,6 +405,34 @@ void Levels(Voice& v, float g[kMixChannels][2]) {
         g[c][0] *= att * std::min(1.0f, 1.0f - pan);
         g[c][1] *= att * std::min(1.0f, 1.0f + pan);
     }
+}
+
+// DSFILTERDESC: mode, Q coefficient, 4 coefficients. The APU's DLS2 low pass (modes 1 and 3) takes its cutoff as
+// FC = 4096 log2(2 sin(pi f / 48000)), 16 bits signed (0 is 8 kHz), and its resonance as K = 32768 10^(-Q / 20), Q the
+// peak in dB at the cutoff; PGR2 works both out itself (0x126E40, 0x126EA0). The parametric EQ (mode 2, MULTI's second
+// section) is not reproduced: PGR2 leaves its gain at 0, which is flat, and anything else is logged once.
+void SetFilter(Voice& v, uint32_t desc) {
+    const uint32_t mode = desc ? R32(desc) : 0, q = desc ? R32(desc + 4) : 0;
+    uint32_t c[4] = {};
+    for (int i = 0; i < 4 && desc; i++) c[i] = R32(desc + 8 + i * 4);
+    if ((mode == 2 && (c[3] & 0xFFFF)) || (mode == 3 && (c[3] & 0xFFFF)))
+        LOG_FIRST(4, "dsound: filter %08X mode %u: its EQ (FC %04X gain %04X Q %u) is not reproduced", v.obj, mode, c[2] & 0xFFFF,
+                  c[3] & 0xFFFF, q);
+    static const bool off = [] {  // XBE_DSOUND_NO_FILTER=1: voices unfiltered, as before (to compare)
+        const char* e = std::getenv("XBE_DSOUND_NO_FILTER");
+        return e && *e && *e != '0';
+    }();
+    const bool on = !off && (mode == 1 || mode == 3);
+    v.lp_mix_to = on ? 1.0f : 0.0f;
+    if (!on) return;  // fades out; the filter keeps its last tuning
+    const float f = std::min(1.0f, std::exp2(float(int16_t(c[0] & 0xFFFF)) / 4096.0f));  // 2 sin(pi fc / fs)
+    const float fc = std::asin(f / 2) / 3.14159265f;                                       // the cutoff over fs
+    const float k = std::clamp(float(c[1] & 0xFFFF) / 32768.0f, 0.05f, 2.0f);              // 1 / Q: the damping
+    const float g = std::tan(3.14159265f * fc);
+    v.lp_g_to = g;
+    v.lp_k_to = k;
+    if (!v.filtered) v.lp_g = g, v.lp_k = k;  // the first tuning at once (its output fades in)
+    v.filtered = true;
 }
 
 // a stream goes quiet: the synch hold ends, a started one loses its pause as well
@@ -446,12 +498,23 @@ void Render(float* out, uint32_t frames) {
         const char* e = std::getenv("XBE_DSOUND_SOLO");
         return e ? uint32_t(std::strtoul(e, nullptr, 16)) : 0u;
     }();
+    static uint64_t block = 0;
+    block++;
+    constexpr uint32_t kFadeIn = 64, kFadeOut = 96;  // frames: 1.3 and 2 ms
     for (auto& [obj, v] : g_voices) {
-        if (v.paused || v.sync || (!v.stream && !v.playing)) continue;
+        if (v.paused || v.sync || (!v.stream && !v.playing && !v.tail)) continue;
         if (solo_tag >= 0 && long(v.tag) != solo_tag) continue;
         if (solo_obj && obj != solo_obj) continue;
         float g[kMixChannels][2];
         Levels(v, g);
+        // the levels at the block's start: the last block's end, or silence for a voice not mixed then
+        float g0[kMixChannels][2] = {};
+        const bool fresh = v.mixed_in + 1 != block;
+        if (!fresh) std::memcpy(g0, v.g_was, sizeof g0);
+        std::memcpy(v.g_was, g, sizeof g);
+        v.mixed_in = block;
+        const bool ending = !v.stream && !v.playing;  // stopped: its tail
+
         const uint32_t nch = std::min<uint32_t>(std::max<uint32_t>(v.channels, 1), kMixChannels);
         uint32_t base = v.data + v.play_start;
         double step = double(v.freq ? v.freq : v.rate) / audio::kRate;
@@ -488,6 +551,7 @@ void Render(float* out, uint32_t frames) {
                 if (f >= end) {
                     if (!v.looping || end <= start) {
                         v.playing = false;
+                        v.tail = 0;
                         v.pos = 0;
                         break;
                     }
@@ -499,13 +563,32 @@ void Render(float* out, uint32_t frames) {
                 at = f;
                 next = f + 1 < end ? f + 1 : v.looping ? start : f;
             }
+            if (ending && !v.tail) break;
+            // how far along from g0 to g: across the block, or over the fade in; a stopped one fades to silence
+            const float w = fresh ? std::min(1.0f, float(i + 1) / kFadeIn) : float(i + 1) / float(frames);
+            const float fade = ending ? float(v.tail--) / kFadeOut : 1.0f;
             float t = float(v.pos - f), l = 0, r = 0;
             for (uint32_t c = 0; c < nch; c++) {
-                if (g[c][0] == 0 && g[c][1] == 0) continue;
+                if (g[c][0] == 0 && g[c][1] == 0 && g0[c][0] == 0 && g0[c][1] == 0 && !v.filtered) continue;  // a filter keeps running, so it never resumes stale
                 float a = Sample(v, from, at, int(c)), a1 = Sample(v, next_from, next, int(c));
                 a += (a1 - a) * t;
-                l += a * g[c][0];
-                r += a * g[c][1];
+                if (v.filtered) {
+                    // a state variable low pass, its trapezoidal form (stable at any cutoff and resonance)
+                    const float a1 = 1 / (1 + v.lp_g * (v.lp_g + v.lp_k)), a2 = v.lp_g * a1, a3 = v.lp_g * a2;
+                    float* s = v.lp_s[c];
+                    float v3 = a - s[1], v1 = a1 * s[0] + a2 * v3, v2 = s[1] + a2 * s[0] + a3 * v3;
+                    s[0] = 2 * v1 - s[0];
+                    s[1] = 2 * v2 - s[1];
+                    a += (v2 - a) * v.lp_mix;
+                }
+                l += a * (g0[c][0] + (g[c][0] - g0[c][0]) * w) * fade;
+                r += a * (g0[c][1] + (g[c][1] - g0[c][1]) * w) * fade;
+            }
+            if (v.filtered) {  // about 2 ms to a new tuning, 5 ms to fade
+                v.lp_g += (v.lp_g_to - v.lp_g) * 0.01f;
+                v.lp_k += (v.lp_k_to - v.lp_k) * 0.01f;
+                v.lp_mix = v.lp_mix_to > v.lp_mix ? std::min(v.lp_mix_to, v.lp_mix + 1.0f / 240)
+                                                  : std::max(v.lp_mix_to, v.lp_mix - 1.0f / 240);
             }
             out[i * 2] += l;
             out[i * 2 + 1] += r;
@@ -897,6 +980,7 @@ BUFFER(SetBufferData, 3) {
 BUFFER(Play, 4) {
     if (DsoundLog()) LOG_FIRST(8, "dsound: Play %08X flags %X", v.obj, a[3]);
     v.playing = true;
+    v.tail = 0;
     v.looping = a[3] & 1;
     if (a[3] & 2) v.pos = 0;
     v.sync = a[3] & 4;
@@ -911,17 +995,20 @@ BUFFER(Pause, 2) {
 // (this, time low, time high, flags): plays now, the start time is not reproduced
 BUFFER(PlayEx, 4) {
     v.playing = true;
+    v.tail = 0;
     v.looping = a[3] & 1;
     if (a[3] & 2) v.pos = 0;
     v.sync = a[3] & 4;
     return 0;
 }
 BUFFER(Stop, 1) {
+    if (v.playing) v.tail = 96;  // fades out (Render)
     v.playing = false;
     return 0;
 }
 // (this, time low, time high, flags): stops now, the release envelope is not reproduced
 BUFFER(StopEx, 4) {
+    if (v.playing) v.tail = 96;
     v.playing = false;
     return 0;
 }
@@ -1002,7 +1089,10 @@ BUFFER(Use3DVoiceData, 2) { return 0; }
 // (this, 3D voice data: flags, then the values they select): copied into the console voice's 3D block, which a host
 // voice does not have; XACT calls it after its own 3D calculation (Forza 0x3F2FD5, the stream's 0x3F3052)
 BUFFER(Set3DVoiceData, 2) { return 0; }
-BUFFER(SetFilter, 2) { return 0; }
+BUFFER(SetFilter, 2) {
+    SetFilter(v, a[1]);
+    return 0;
+}
 BUFFER(SetHeadroom, 2) {
     v.headroom = Db(-int32_t(a[1]));
     return 0;
@@ -1189,7 +1279,10 @@ STREAM(SetFrequency, 2) {
     v.freq = a[1];
     return 0;
 }
-STREAM(SetFilter, 2) { return 0; }
+STREAM(SetFilter, 2) {
+    SetFilter(v, a[1]);
+    return 0;
+}
 // the library's own writes voice registers a host stream does not have; envelopes and the LFO are not played
 HLE_STDCALL(IDirectSoundStream_SetEG, 2) { return 0; }
 HLE_STDCALL(IDirectSoundStream_SetLFO, 2) { return 0; }

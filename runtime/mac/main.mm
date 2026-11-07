@@ -10,7 +10,9 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <codecvt>
 #include <csignal>
@@ -415,6 +417,37 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         buf.resize(size_t(frames) * 2);
         (*pull)(buf.data(), uint32_t(frames));
         SDL_PutAudioStreamData(stream, buf.data(), frames * 8);
+        // XBE_AUDIO_WAV=file (testing): what the mixer hands the output, as 16 bit stereo at kRate, beside the executable
+        // unless a path; its header is kept current, so the file plays even if the game is killed
+        static FILE* wav = [] {
+            const char* e = std::getenv("XBE_AUDIO_WAV");
+            if (!e || !*e) return (FILE*)nullptr;
+            std::filesystem::path p = e;
+            if (p.is_relative()) p = app::ExeDir() / p;
+            FILE* f = std::fopen(p.string().c_str(), "wb");
+            if (f) LOGR("audio: recording the output to %s", p.string().c_str());
+            return f;
+        }();
+        if (wav) {
+            static uint32_t bytes = 0;
+            static std::vector<int16_t> pcm;
+            pcm.resize(buf.size());
+            for (size_t i = 0; i < buf.size(); i++) pcm[i] = int16_t(std::lround(std::clamp(buf[i], -1.0f, 1.0f) * 32767));
+            std::fseek(wav, 44 + long(bytes), SEEK_SET);
+            std::fwrite(pcm.data(), 2, pcm.size(), wav);
+            bytes += uint32_t(pcm.size() * 2);
+            auto u32 = [](uint8_t* p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = uint8_t(v >> (8 * i)); };
+            uint8_t h[44] = {'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ', 16, 0, 0, 0, 1, 0, 2, 0};
+            u32(h + 4, 36 + bytes);
+            u32(h + 24, kRate);
+            u32(h + 28, kRate * 4);
+            h[32] = 4, h[34] = 16;
+            std::memcpy(h + 36, "data", 4);
+            u32(h + 40, bytes);
+            std::fseek(wav, 0, SEEK_SET);
+            std::fwrite(h, 1, 44, wav);
+            std::fflush(wav);
+        }
     };
     SDL_AudioStream* s = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, cb, nullptr);
     if (!s) {

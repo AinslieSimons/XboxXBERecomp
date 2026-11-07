@@ -44,23 +44,26 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         if (wav) WavHeader(wav, 0);
         LOGI("audio: output started, written to %s", name);  // the log's time of the file's first sample
     }
-    std::thread([render, wav] {
-        std::vector<float> b(kRate / 100 * 2);
+    // AUDIO_BLOCK=frames: the mixer pulled in blocks of that many frames (the Mac's SDL output pulls 1024), else 10 ms
+    const char* blk = std::getenv("AUDIO_BLOCK");
+    const uint32_t block = blk && std::atoi(blk) > 0 ? uint32_t(std::atoi(blk)) : kRate / 100;
+    std::thread([render, wav, block] {
+        std::vector<float> b(size_t(block) * 2);
         std::vector<int16_t> pcm(b.size());
         uint32_t bytes = 0;
         auto next = std::chrono::steady_clock::now();
         for (int n = 0;; n++) {
-            render(b.data(), kRate / 100);
+            render(b.data(), block);
             if (wav) {
                 for (size_t i = 0; i < b.size(); i++) pcm[i] = int16_t(std::lround(b[i] * 32767.0f));
                 std::fwrite(pcm.data(), 2, pcm.size(), wav);
                 bytes += uint32_t(pcm.size() * 2);
-                if (n % 100 == 0) {  // a run ends by being killed: the header says what is there each second
+                if (n % (kRate / block) == 0) {  // a run ends by being killed: the header says what is there each second
                     WavHeader(wav, bytes);
                     std::fflush(wav);
                 }
             }
-            next += std::chrono::milliseconds(10);
+            next += std::chrono::microseconds(int64_t(block) * 1000000 / kRate);
             std::this_thread::sleep_until(next);
         }
     }).detach();

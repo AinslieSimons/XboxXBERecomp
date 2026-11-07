@@ -62,6 +62,7 @@ Environment:
   `init` may set it), 60 when that is 0; within that, the title's present interval (`D3D_PresentInterval`): 60 a
   second over the number of vertical blanks it asks for
 - `WAV=file` the mixed output also written to that file in the run folder (48 kHz, 16 bit stereo); the log's
+- `AUDIO_BLOCK=frames` the mixer pulled in blocks of that many frames instead of 10 ms (the macOS SDL output pulls 1024)
   `audio: output started` line is the time of its first sample
 - `OUTPUT=WxH` the display size the game is told about, 1280x720 by default: narrower than 3:2 the console reports
   a 4:3 TV instead of a widescreen one
