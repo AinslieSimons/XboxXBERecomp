@@ -12,6 +12,7 @@
 
 #include "app/app.h"
 #include "audio/audio.h"
+#include "audio/reverb.h"
 #include "xbe/xbe.h"
 #include "xdk/hle.h"
 #include "xdk/layout.h"
@@ -235,7 +236,7 @@ struct Voice {
     // waveform at a block's first sample, which crackles when many loud effects come and go (live, 1024 frame blocks).
     // The APU ramps such changes; here a voice glides from the levels it was mixed at last (g_was, mixed_in), a new one
     // fades in over kFadeIn frames and a stopped buffer plays on, fading, for tail frames.
-    float g_was[6][2] = {};
+    float g_was[6][2] = {}, reverb_was = 0;
     uint64_t mixed_in = 0;  // the block it was last mixed in (0: none)
     uint32_t tail = 0;
     // ADPCM block cache
@@ -250,6 +251,18 @@ struct Done {
 std::recursive_mutex g_lock;
 std::map<uint32_t, Voice> g_voices;
 float g_listener[3] = {}, g_front[3] = {0, 0, 1}, g_top[3] = {0, 1, 0};
+// mix bin 10 (DSMIXBIN_I3DL2): the APU's I3DL2 reverb, on the host (audio/reverb.cpp), set by IDirectSound_SetI3DL2Listener.
+// XBE_DSOUND_NO_REVERB=1 leaves it out (the bin then unheard, as before).
+constexpr uint32_t kReverbBin = 10;
+audio::Reverb g_reverb;
+std::vector<float> g_reverb_in;
+bool ReverbOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("XBE_DSOUND_NO_REVERB");
+        return !(e && *e && *e != '0');
+    }();
+    return on;
+}
 // Completed packets' callbacks, run as the XDK runs them: in DirectSoundDoWork on the title's thread, so they never
 // overlap the title's own stream code. A stream flushed or released runs its own at once, before it is gone.
 std::deque<Done> g_done;
@@ -336,7 +349,9 @@ constexpr float kMixBinGain = 1.0f / float(1u << XDK_DSound_MixBinHeadroom);
 // channels to front left, front right, centre, LFE, back left and back right in turn (EoN's driving missions mix
 // their music and speech into one 6 channel buffer, the speech in the centre).
 constexpr uint32_t kMixChannels = 6;
-void Levels(Voice& v, float g[kMixChannels][2]) {
+// reverb (when asked): the voice's send to the reverb (mix bin 10), its channels summed
+void Levels(Voice& v, float g[kMixChannels][2], float* reverb = nullptr) {
+    if (reverb) *reverb = 0;
     static const uint8_t kDefault[kMixChannels] = {0, 1, 2, 3, 4, 5};
     const uint8_t* bin = v.nbins ? v.bin : kDefault;
     const uint32_t channels = std::min<uint32_t>(std::max<uint32_t>(v.channels, 1), kMixChannels);
@@ -354,7 +369,7 @@ void Levels(Voice& v, float g[kMixChannels][2]) {
         for (uint32_t s = 0; s < n; s++)
             if (bin[s] == mute_bin && v.bin_mb[bin[s]] > -10000) {
                 std::memset(g, 0, sizeof(float) * kMixChannels * 2);
-                return;
+                return;  // the reverb send stays 0
             }
     bool speakers = false;
     for (uint32_t s = 0; s < n; s++) speakers |= bin[s] < 10 && bin[s] != 3 && (!v.nbins || v.bin_mb[bin[s]] > -10000);
@@ -370,6 +385,7 @@ void Levels(Voice& v, float g[kMixChannels][2]) {
         for (uint32_t s = first + (channels == 1 ? 0 : c % 2); s < last && s < n; s += step) {
             uint32_t b = bin[s];
             if (speakers && (b == 3 || b > 9)) continue;  // sub and effect sends
+            if (b == kReverbBin && ReverbOn()) continue;  // the reverb's own (below)
             // the centre and the back pair folded into left and right 3 dB down, as a stereo downmix of 5.1 does
             const float fold = b == 2 || (speakers && (b == 4 || b == 5)) ? 0.707f : 1.0f;
             float x = Db(v.bin_mb[b]) * v.volume * v.headroom * fold * kMixBinGain * send_level * stream_level;
@@ -382,6 +398,12 @@ void Levels(Voice& v, float g[kMixChannels][2]) {
             if (!speakers || b == 2 || (b & 1)) g[c][1] = std::max(g[c][1], x);
         }
     }
+    if (reverb && ReverbOn())
+        for (uint32_t s = 0; s < n; s++)
+            if (bin[s] == kReverbBin && v.bin_mb[kReverbBin] > -10000) {
+                *reverb = Db(v.bin_mb[kReverbBin]) * v.volume * v.headroom * kMixBinGain * stream_level;
+                break;
+            }
     if (!v.is3d || v.mode == 2) return;
     bool rel = v.mode == 1;  // the position is already in listener space
     float d[3] = {v.p[0], v.p[1], v.p[2]};
@@ -405,6 +427,7 @@ void Levels(Voice& v, float g[kMixChannels][2]) {
         g[c][0] *= att * std::min(1.0f, 1.0f - pan);
         g[c][1] *= att * std::min(1.0f, 1.0f + pan);
     }
+    if (reverb) *reverb *= att;
 }
 
 // DSFILTERDESC: mode, Q coefficient, 4 coefficients. The APU's DLS2 low pass (modes 1 and 3) takes its cutoff as
@@ -500,18 +523,23 @@ void Render(float* out, uint32_t frames) {
     }();
     static uint64_t block = 0;
     block++;
+    const bool reverb = ReverbOn();
+    if (reverb) g_reverb_in.assign(frames, 0.0f);
     constexpr uint32_t kFadeIn = 64, kFadeOut = 96;  // frames: 1.3 and 2 ms
     for (auto& [obj, v] : g_voices) {
         if (v.paused || v.sync || (!v.stream && !v.playing && !v.tail)) continue;
         if (solo_tag >= 0 && long(v.tag) != solo_tag) continue;
         if (solo_obj && obj != solo_obj) continue;
-        float g[kMixChannels][2];
-        Levels(v, g);
+        float g[kMixChannels][2], rv = 0;
+        Levels(v, g, reverb ? &rv : nullptr);
         // the levels at the block's start: the last block's end, or silence for a voice not mixed then
         float g0[kMixChannels][2] = {};
         const bool fresh = v.mixed_in + 1 != block;
+        const float rv0 = fresh ? 0.0f : v.reverb_was;
         if (!fresh) std::memcpy(g0, v.g_was, sizeof g0);
         std::memcpy(v.g_was, g, sizeof g);
+        v.reverb_was = rv;
+        const bool sends = rv > 0 || rv0 > 0;
         v.mixed_in = block;
         const bool ending = !v.stream && !v.playing;  // stopped: its tail
 
@@ -567,9 +595,9 @@ void Render(float* out, uint32_t frames) {
             // how far along from g0 to g: across the block, or over the fade in; a stopped one fades to silence
             const float w = fresh ? std::min(1.0f, float(i + 1) / kFadeIn) : float(i + 1) / float(frames);
             const float fade = ending ? float(v.tail--) / kFadeOut : 1.0f;
-            float t = float(v.pos - f), l = 0, r = 0;
+            float t = float(v.pos - f), l = 0, r = 0, mono = 0;
             for (uint32_t c = 0; c < nch; c++) {
-                if (g[c][0] == 0 && g[c][1] == 0 && g0[c][0] == 0 && g0[c][1] == 0 && !v.filtered) continue;  // a filter keeps running, so it never resumes stale
+                if (g[c][0] == 0 && g[c][1] == 0 && g0[c][0] == 0 && g0[c][1] == 0 && !v.filtered && !sends) continue;  // a filter keeps running, so it never resumes stale
                 float a = Sample(v, from, at, int(c)), a1 = Sample(v, next_from, next, int(c));
                 a += (a1 - a) * t;
                 if (v.filtered) {
@@ -583,6 +611,7 @@ void Render(float* out, uint32_t frames) {
                 }
                 l += a * (g0[c][0] + (g[c][0] - g0[c][0]) * w) * fade;
                 r += a * (g0[c][1] + (g[c][1] - g0[c][1]) * w) * fade;
+                mono += a;
             }
             if (v.filtered) {  // about 2 ms to a new tuning, 5 ms to fade
                 v.lp_g += (v.lp_g_to - v.lp_g) * 0.01f;
@@ -592,7 +621,32 @@ void Render(float* out, uint32_t frames) {
             }
             out[i * 2] += l;
             out[i * 2 + 1] += r;
+            if (sends) g_reverb_in[i] += mono * (rv0 + (rv - rv0) * w) * fade;
             v.pos += step;
+        }
+    }
+    if (reverb) {
+        // XBE_DSOUND_LOG: the reverb's input and what it adds, against the dry mix, every 5 s
+        static double in2 = 0, dry2 = 0, wet2 = 0;
+        static uint64_t seen = 0;
+        std::vector<float> dry;
+        if (log_voices) {
+            dry.assign(out, out + frames * 2);
+            for (uint32_t i = 0; i < frames; i++) in2 += double(g_reverb_in[i]) * g_reverb_in[i];
+        }
+        g_reverb.Process(g_reverb_in.data(), out, frames);
+        if (log_voices) {
+            for (uint32_t i = 0; i < frames * 2; i++) {
+                dry2 += double(dry[i]) * dry[i];
+                wet2 += double(out[i] - dry[i]) * (out[i] - dry[i]);
+            }
+            if ((seen += frames) >= uint64_t(audio::kRate) * 5) {
+                auto db = [](double e, double n) { return e > 0 ? 10 * std::log10(e / n) : -999.0; };
+                LOGR("dsound: reverb in %.1f dBFS, adds %.1f dBFS to a dry mix of %.1f dBFS", db(in2, double(seen)), db(wet2, 2.0 * seen),
+                     db(dry2, 2.0 * seen));
+                in2 = dry2 = wet2 = 0;
+                seen = 0;
+            }
         }
     }
     for (uint32_t i = 0; i < frames * 2; i++) out[i] = std::clamp(out[i], -1.0f, 1.0f);
@@ -844,7 +898,32 @@ HLE_STDCALL(IDirectSound_SetDopplerFactor, 3) { return 0; }
 HLE_STDCALL(IDirectSound_SetRolloffFactor, 3) { return 0; }
 HLE_STDCALL(IDirectSound_SetDistanceFactor, 3) { return 0; }
 HLE_STDCALL(IDirectSound_SetVelocity, 5) { return 0; }
-HLE_STDCALL(IDirectSound_SetI3DL2Listener, 3) { return 0; }
+// (this, DSI3DL2LISTENER, apply): the environment the reverb (mix bin 10) takes on
+HLE_STDCALL(IDirectSound_SetI3DL2Listener, 3) {
+    if (!a[1]) return 0;
+    audio::I3dl2 p;
+    p.room = int32_t(R32(a[1]));
+    p.room_hf = int32_t(R32(a[1] + 4));
+    p.rolloff = F32(R32(a[1] + 8));
+    p.decay = F32(R32(a[1] + 12));
+    p.decay_hf = F32(R32(a[1] + 16));
+    p.reflections = int32_t(R32(a[1] + 20));
+    p.reflections_delay = F32(R32(a[1] + 24));
+    p.reverb = int32_t(R32(a[1] + 28));
+    p.reverb_delay = F32(R32(a[1] + 32));
+    p.diffusion = F32(R32(a[1] + 36));
+    p.density = F32(R32(a[1] + 40));
+    p.hf_reference = F32(R32(a[1] + 44));
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    static audio::I3dl2 last;
+    if (!std::memcmp(&last, &p, sizeof p)) return 0;  // the title sends it every frame
+    last = p;
+    g_reverb.Set(p);
+    if (DsoundLog())
+        LOGI("dsound: I3DL2 listener room %d hf %d decay %.2f s (hf x%.2f) reflections %d at %.3f s, reverb %d at %.3f s", p.room,
+             p.room_hf, p.decay, p.decay_hf, p.reflections, p.reflections_delay, p.reverb, p.reverb_delay);
+    return 0;
+}
 HLE_STDCALL(IDirectSound_SetPosition, 5) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     for (int i = 0; i < 3; i++) g_listener[i] = F32(a[1 + i]);
