@@ -335,8 +335,16 @@ public:
     void RecordLate(uint32_t data) override;
     void Flush() override {
         @autoreleasepool {
-            id<MTLCommandBuffer> sent = Commit();
-            if (!reports_.empty() && sent) [sent waitUntilCompleted];
+            // what a report waits for may have gone in an earlier commit: a title polling for it in a loop without presenting
+            // has no later flush to deliver it (PGR2 froze at a race's end, waiting on every light test in 0x187DC0). The
+            // queue finishes in order, and a completed handler can still be to come after this wait, so the serial moves here.
+            Commit();
+            if (!reports_.empty() && last_sent_) {
+                [last_sent_ waitUntilCompleted];
+                const uint64_t serial = next_serial_ - 1;
+                uint64_t seen = completed_serial_.load();
+                while (seen < serial && !completed_serial_.compare_exchange_weak(seen, serial)) {}
+            }
             DeliverReports();
         }
     }
@@ -464,6 +472,7 @@ private:
     id<MTLCommandQueue> queue_;
     CAMetalLayer* layer_ = nil;
     id<MTLCommandBuffer> cb_;
+    id<MTLCommandBuffer> last_sent_;  // the newest committed
     id<MTLRenderCommandEncoder> enc_;
     id<MTLTexture> enc_colour_, enc_depth_;
     id<MTLBuffer> rings_[kFramesInFlight];
@@ -631,6 +640,7 @@ id<MTLCommandBuffer> MetalBackend::Commit() {
     }];
     [sent commit];
     cb_ = nil;
+    last_sent_ = sent;
     return sent;
 }
 
