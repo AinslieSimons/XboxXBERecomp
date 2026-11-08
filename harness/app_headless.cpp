@@ -53,6 +53,10 @@ std::filesystem::path ExeDir() {
     static const std::filesystem::path dir = std::filesystem::current_path();
     return dir;
 }
+// a screenshot asked for (XBE_SHOT_READS): the reference renderer's snap of the next frames (null_backend.cpp)
+void RequestScreenshot() {
+    if (FILE* f = std::fopen((ExeDir() / "snap").string().c_str(), "w")) std::fclose(f);
+}
 int Instance() {
     static const int n = [] {
         const char* e = std::getenv("INSTANCE");

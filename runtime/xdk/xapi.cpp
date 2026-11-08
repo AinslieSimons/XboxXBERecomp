@@ -1,7 +1,14 @@
 // XAPI functions that talk to hardware: controller ports and the hard disk cache partition
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <vector>
 
+#include "app/app.h"
 #include "core/input.h"
+#include "core/log.h"
 #include "xdk/hle.h"
 #include "xdk/layout.h"
 
@@ -53,6 +60,68 @@ struct Handle {
     input::Pad last;
 };
 std::unordered_map<uint32_t, Handle> g_handles;
+
+// Controller 1 recorded and played back, for repeatable runs. Keyed to the title's own reads of that controller
+// (XInputGetState on port 0, once a frame in PGR2), not the clock, so a playback presses the same buttons on the same
+// frames however long loading takes. XBE_PAD_RECORD=file writes each change: "read buttons a b x y black white lt rt
+// lx ly rx ry" (buttons in hex, the rest decimal), with the clock in a comment; XBE_PAD_PLAY=file plays one back in
+// place of the controller, and then the controller again once it ends (XBE_PAD_PLAY_HOLD=1: the last state held).
+// Relative paths are beside the executable.
+struct PadTrack {
+    uint64_t read;
+    input::Pad pad;
+};
+std::filesystem::path PadPath(const char* e) {
+    std::filesystem::path p = e;
+    return p.is_relative() ? app::ExeDir() / p : p;
+}
+FILE* PadRecordFile() {
+    static FILE* f = [] {
+        const char* e = std::getenv("XBE_PAD_RECORD");
+        if (!e || !*e) return (FILE*)nullptr;
+        FILE* f = std::fopen(PadPath(e).string().c_str(), "w");
+        if (f) {
+            std::fprintf(f, "# controller 1 by the title's reads of it (XInputGetState, port 0): read buttons a b x y black white lt rt lx ly rx ry\n");
+            LOGR("input: recording controller 1 to %s", PadPath(e).string().c_str());
+        }
+        return f;
+    }();
+    return f;
+}
+const std::vector<PadTrack>& PadPlayback() {
+    static const std::vector<PadTrack> track = [] {
+        std::vector<PadTrack> t;
+        const char* e = std::getenv("XBE_PAD_PLAY");
+        if (!e || !*e) return t;
+        FILE* f = std::fopen(PadPath(e).string().c_str(), "r");
+        if (!f) {
+            LOGE("input: no pad recording at %s", PadPath(e).string().c_str());
+            return t;
+        }
+        char line[256];
+        while (std::fgets(line, sizeof line, f)) {
+            if (line[0] == '#') continue;
+            unsigned long long read;
+            unsigned buttons, a[8];
+            int lx, ly, rx, ry;
+            if (std::sscanf(line, "%llu %x %u %u %u %u %u %u %u %u %d %d %d %d", &read, &buttons, &a[0], &a[1], &a[2], &a[3], &a[4], &a[5], &a[6],
+                            &a[7], &lx, &ly, &rx, &ry) != 14)
+                continue;
+            PadTrack k{read, {}};
+            k.pad.connected = true;
+            k.pad.buttons = uint16_t(buttons);
+            for (int i = 0; i < 8; i++) k.pad.analog[i] = uint8_t(a[i]);
+            k.pad.lx = int16_t(lx), k.pad.ly = int16_t(ly), k.pad.rx = int16_t(rx), k.pad.ry = int16_t(ry);
+            t.push_back(k);
+        }
+        std::fclose(f);
+        LOGR("input: playing controller 1 from %s, %zu changes to read %llu", PadPath(e).string().c_str(), t.size(),
+             t.empty() ? 0ull : (unsigned long long)t.back().read);
+        return t;
+    }();
+    return track;
+}
+uint64_t g_pad_reads = 0;  // the title's reads of controller 1
 
 }  // namespace
 
@@ -109,6 +178,58 @@ HLE_STDCALL(XInputGetState, 2) {
         port = it->second.port;
     }
     input::Pad p = input::Poll(int(port));
+    if (port == 0) {
+        const uint64_t read = g_pad_reads++;
+        const auto& track = PadPlayback();
+        static const bool hold = [] {
+            const char* e = std::getenv("XBE_PAD_PLAY_HOLD");
+            return e && *e == '1';
+        }();
+        if (!track.empty() && (read <= track.back().read || hold)) {
+            // the last change at or before this read
+            auto it = std::upper_bound(track.begin(), track.end(), read, [](uint64_t r, const PadTrack& k) { return r < k.read; });
+            if (it != track.begin()) p = std::prev(it)->pad;
+            else p = input::Pad{true};
+            if (read == track.back().read) LOGR("input: the pad recording ends at read %llu", (unsigned long long)read);
+        }
+        // XBE_SHOT_READS="r1 r2 ..." (testing): a screenshot at each of those reads of controller 1, the same frames in
+        // every playback of one recording
+        static const std::vector<uint64_t> shots = [] {
+            std::vector<uint64_t> v;
+            if (const char* e = std::getenv("XBE_SHOT_READS"))
+                for (char* end = nullptr; *e; e = end) {
+                    const uint64_t r = std::strtoull(e, &end, 10);
+                    if (end == e) break;
+                    v.push_back(r);
+                }
+            return v;
+        }();
+        if (std::find(shots.begin(), shots.end(), read) != shots.end()) {
+            app::RequestScreenshot();
+            LOGR("input: screenshot at read %llu", (unsigned long long)read);
+        }
+        if (FILE* f = PadRecordFile()) {
+            static input::Pad last{};
+            static const auto start = std::chrono::steady_clock::now();
+            static uint64_t reads_then = 0;
+            static auto then = start;
+            const bool same = p.buttons == last.buttons && !std::memcmp(p.analog, last.analog, sizeof p.analog) && p.lx == last.lx &&
+                              p.ly == last.ly && p.rx == last.rx && p.ry == last.ry;
+            if (read == 0 || !same) {
+                const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                std::fprintf(f, "%llu %X %u %u %u %u %u %u %u %u %d %d %d %d # %.2f s\n", (unsigned long long)read, p.buttons, p.analog[0],
+                             p.analog[1], p.analog[2], p.analog[3], p.analog[4], p.analog[5], p.analog[6], p.analog[7], p.lx, p.ly, p.rx, p.ry, t);
+                std::fflush(f);
+                last = p;
+            }
+            // how often the title reads it, to tell a frame's read from a timer's
+            const auto now = std::chrono::steady_clock::now();
+            if (now - then >= std::chrono::seconds(10)) {
+                LOGR("input: controller 1 read %llu times in the last 10 s", (unsigned long long)(read - reads_then));
+                reads_then = read, then = now;
+            }
+        }
+    }
     if (!p.connected) return 1167;  // ERROR_DEVICE_NOT_CONNECTED
     std::lock_guard<std::mutex> lock(g_ports_lock);
     Handle& h = g_handles[a[0]];
