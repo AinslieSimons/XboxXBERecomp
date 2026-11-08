@@ -250,6 +250,26 @@ struct DrawAdjust {
     uint32_t start = 0, count = 0;
     const uint8_t* indices = nullptr;
     uint32_t stage3 = 0;  // a guest texture in place of stage 3's, for this draw alone
+    // ray traced reflections, on a backend that has them (Metal). frame: the frames presented so far, set for the filter
+    uint64_t frame = 0;
+    // trace_scene: the draw's triangles (input register 0, to the world by trace_world: 3 rows of 4) join this frame's
+    // scene, which the next frame's reflections are traced against. A hit is shaded as the draw is: stage 0's texture
+    // at input register 2's coordinates times trace_uv, times trace_colour (rgb) lit at each vertex from trace_light (xyz
+    // toward the light, w the share of the colour shown unlit) by input register 1's normal, plus the cube along the
+    // ray reflected there, trace_colour.a of it (scaled by the texture's alpha unless trace_glass)
+    // trace_draw: the draw's number in the frame's scene (the filter's count); trace_self: a traced draw's own number
+    // in the last frame's scene, 1 up (0 none). The backend groups a scene's draws into objects (the largest first,
+    // each other draw joining the one whose bounds hold its centre) and a ray passes through its own object's triangles
+    bool trace_scene = false, trace_glass = false;
+    uint32_t trace_draw = 0, trace_self = 0;
+    uint64_t trace_mesh = 0;  // the same vertices as every draw with this key (0 none): the backend keeps them
+    float trace_world[12] = {}, trace_colour[4] = {}, trace_light[4] = {}, trace_uv = 0;
+    // trace_reflect: stage 3's cube is read along a ray traced against the last frame's scene first, the cube where it
+    // hits nothing. The ray starts at the pixel's place in that scene, trace_from (3 rows of 4) of (x w, y w, w, 1) with x
+    // and y the console pixel and w the pixel's own, and goes along stage 3's direction turned by trace_turn (3 rows of
+    // 4, w unused); trace_range: the longest ray, and how far from the pixel it starts
+    bool trace_reflect = false;
+    float trace_from[12] = {}, trace_turn[12] = {}, trace_range[2] = {};
 };
 using DrawFilter = void (*)(const State&, DrawAdjust&);
 inline DrawFilter g_draw_filter = nullptr;

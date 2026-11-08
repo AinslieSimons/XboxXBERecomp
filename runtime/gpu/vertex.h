@@ -63,4 +63,8 @@ void FvfInputs(uint32_t fvf, VertexShader& out);
 // indices: the title's 16 bit indices, null for an unindexed draw
 bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, Assembled& out);
 
+// the draw's triangles as input register reg holds them, three x y z each, added to out (a draw of points or lines adds
+// none); false when there are none or the vertices are outside the guest's memory
+bool DrawTriangles(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, int reg, std::vector<float>& out);
+
 }  // namespace gpu

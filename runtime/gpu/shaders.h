@@ -27,6 +27,9 @@ enum : uint8_t {
     kTexDepthBytes = 16,
     kTexDepthAbgr = 32,
     kTexDepthBgra = 64,
+    // a cube read along a ray traced first against the backend's scene of triangles (DrawAdjust::trace_reflect), the cube
+    // where the ray hits nothing; DrawConstants::trace says how
+    kTexTraced = 128,
 };
 // a 32 bit colour format a depth buffer can be read through: 1 A8R8G8B8's byte order, 2 A8B8G8R8's, 3 B8G8R8A8's
 // (007: Everything or Nothing's weapon carousel reads its depth buffer as LIN_B8G8R8A8), 0 another
@@ -137,6 +140,9 @@ struct DrawConstants {
     float hud[4];        // pretransformed x squeezed about hud[1] (half the width) by hud[0] (ultrawide 2D), else 1;
                          // [2] depth tested; [3] W-buffered: z kept within w (no far plane clipping)
     float pts[4];        // point sprites on, size min, size max, D3DRS_POINTSIZE (console pixels)
+    // kTexTraced: rows 0 to 2 the pixel's place in the scene from (x w, y w, w, 1), x and y the host pixel; row 3 on, the
+    // longest ray, how far from the pixel it starts; rows 4 to 6 the cube's direction turned into the scene
+    float trace[8][4];
 };
 
 }  // namespace gpu

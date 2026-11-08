@@ -474,6 +474,43 @@ void FvfInputs(uint32_t fvf, VertexShader& vs) {
     vs.stream_stride[0] = off;
 }
 
+bool DrawTriangles(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* ip, int reg, std::vector<float>& out) {
+    using namespace kernel;
+    if (prim < 5 || prim > 10 || !count || s.input_active || reg < 0 || reg > 15) return false;
+    VertexShader fvf_layout;
+    const VertexShader* layout = PickLayout(s, fvf_layout);
+    if (!layout) return false;
+    const auto& in = layout->inputs[size_t(reg)];
+    if (in.stream < 0 || !in.type || in.type == kTypeNone || !s.streams[size_t(in.stream)].vb) return false;
+    IndexBounds bounds = {0, count - 1};
+    if (ip) bounds = IndexRange(ip, count);
+    DrawRange d;
+    d.prim = prim;
+    d.start = start;
+    d.count = count;
+    d.ip = ip;
+    d.first = bounds.first;
+    d.first_vertex = ip ? bounds.first + s.base_vertex : start;
+    d.span = bounds.last - bounds.first + 1;
+    const int regs[1] = {reg};
+    uint64_t bad_from = 0, bad_to = 0;
+    if (!VerticesReadable(s, Inputs{*layout, regs, 1}, d, bad_from, bad_to)) return false;
+    const uint32_t data = mem::VirtualFromPhysical(R32(s.streams[size_t(in.stream)].vb + kResData));
+    const uint32_t stride = StrideOf(s, *layout, in);
+    const uint8_t* src = static_cast<const uint8_t*>(HostPtr(data + in.offset));
+    thread_local std::vector<uint32_t> ix;
+    ix.clear();
+    Topology topology;
+    ListIndices(prim, count, [](uint32_t i) { return i; }, ix, topology);
+    out.reserve(out.size() + ix.size() * 3);
+    for (uint32_t i : ix) {
+        float v[4];
+        Convert(in.type, src + size_t(DrawVertex(s, d, i)) * stride, v);
+        out.insert(out.end(), {v[0], v[1], v[2]});
+    }
+    return !ix.empty();
+}
+
 bool Assemble(const State& state, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* ip, Assembled& out) {
     ResetAssembled(out);
     if (!count || prim < 1 || prim > 10) return false;

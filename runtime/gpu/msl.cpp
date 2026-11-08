@@ -315,7 +315,17 @@ std::string PixelMsl(const std::string& hlsl) {
     std::string fields;
     std::string body = Body(src, globals, fields, true);
     std::string extra, handles, pass;
+    bool traced = false;
     for (const Global& g : globals) {
+        if (g.type == "TexTrace") {  // kTexTraced: the scene, its triangles' shading and their textures (from slot 8)
+            traced = true;
+            const std::string as = "raytracing::primitive_acceleration_structure " + g.name, colour = "const device uint* " + g.name + "_colour",
+                              tex = "array<texture2d<float>, 16> " + g.name + "_tex";
+            extra += (extra.empty() ? "" : ", ") + as + ", " + colour + ", " + tex;
+            handles += ", " + as + " [[buffer(1)]], " + colour + " [[buffer(2)]], " + tex + " [[texture(8)]]";
+            pass += ", " + g.name + ", " + g.name + "_colour, " + g.name + "_tex";
+            continue;
+        }
         const bool smp = g.type == "sampler";
         extra += (extra.empty() ? "" : ", ") + g.type + " " + g.name;
         handles += ", " + HandleType(g.type) + " " + g.name + (smp ? " [[sampler(" : " [[texture(") + std::to_string(g.slot) + ")]]";
@@ -323,7 +333,7 @@ std::string PixelMsl(const std::string& hlsl) {
     }
     EntrySig sig;
     RewriteEntry(body, "main", extra, sig);
-    std::string out = kPrelude;
+    std::string out = std::string(traced ? "#include <metal_raytracing>\n" : "") + kPrelude;
     out += "struct Shader {\n" + fields + body + "};\n";
     std::string fout = "struct FOut { float4 colour [[color(0)]];";
     std::string call = "S.main(i, front";

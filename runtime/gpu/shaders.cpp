@@ -63,6 +63,7 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 wdepth;
     float4 hud;
     float4 pts;  // point sprites on, size min, size max, D3DRS_POINTSIZE
+    float4 trace[8];  // kTexTraced
 };
 )";
 
@@ -411,6 +412,7 @@ std::string TexFetch(const PixelKey& k, int i) {
         return F("tex%d.Sample(smp%d, %s)", i, i, uv.c_str());
     };
     auto cube = [&](const std::string& dir) {
+        if (t.flags & kTexTraced) return F("traced(scene, scene_colour, scene_tex, tex%d, smp%d, %s, i.pos.xy, i.wlin)", i, i, dir.c_str());
         std::string c = Hooks().Cube(t, i, dir);
         return c.empty() ? F("tex%d.Sample(smp%d, %s)", i, i, dir.c_str()) : c;
     };
@@ -517,6 +519,90 @@ uint alphacover(float a, uint samples) {
     if (a <= 0 || c <= 0) discard;
     uint n = min((uint)ceil(c * samples), samples);
     return (1u << n) - 1;
+}
+)";
+
+// kTexTraced, written for Metal (gpu/msl.cpp passes the scene in): the reflection ray from the pixel's place in the scene,
+// what it hits shaded as that car draws it (its texture, its lit colour and the cube reflected there; faded out toward
+// the longest ray) over the cube
+const char* kPsTraced = R"(
+float4 traced(raytracing::primitive_acceleration_structure as, const device uint* tri, array<texture2d<float>, 16> stex, TexCube cube, sampler sm, float3 dir, float2 px, float w) {
+    float4 env = cube.Sample(sm, dir);
+    float3 u = float3(px * w, w);
+    float3 o = float3(dot(trace[0].xyz, u) + trace[0].w, dot(trace[1].xyz, u) + trace[1].w, dot(trace[2].xyz, u) + trace[2].w);
+    float3 d = float3(dot(trace[4].xyz, dir), dot(trace[5].xyz, dir), dot(trace[6].xyz, dir));
+    float len = length(d);
+    if (trace[3].x == 0 || !(len > 1e-6)) return env;
+    d /= len;
+    // the surface's own facing, from the place across neighbouring pixels, turned toward the eye (the place of w 0): a
+    // direction blended across a triangle can point into the surface, and such a ray would find the inside of the car
+    float3 n = cross(dfdx(o), dfdy(o));
+    float3 eye = float3(trace[0].w, trace[1].w, trace[2].w) - o;
+    if (dot(n, eye) < 0) n = -n;
+    // 6 (XBE_TRACE_DEBUG): the scene's place checked, a ray from the eye to the pixel's own place, culling and self left
+    // in: green where it hits at the pixel (within 15 cm), red short of it, yellow past it, blue nothing
+    if (trace[3].w == 6) {
+        float3 e = float3(trace[0].w, trace[1].w, trace[2].w);
+        float L = length(o - e);
+        raytracing::intersector<raytracing::triangle_data> look;
+        auto g = look.intersect(raytracing::ray(e, (o - e) / max(L, 1e-4), 0.0, L + 3.0), as);
+        if (g.type == raytracing::intersection_type::none) return float4(0, 0, 1, env.a);
+        float off = g.distance - L;
+        return float4(abs(off) < 0.15 ? float3(0, 1, 0) : off < 0 ? float3(1, 0, 0) : float3(1, 1, 0), env.a);
+    }
+    if (dot(n, d) <= 0) return env;
+    raytracing::ray r(o + d * trace[3].z, d, 0.0, trace[3].y);
+    // the triangles' faces (trace[7].x): those seen from behind left out, 1 clockwise ones in front, 2 anticlockwise (a
+    // ray leaving a car's surface into the car, as the reflection direction blended across a triangle does, then hits
+    // nothing of it). The reflecting car's own triangles (trace[7].y, its object 1 up) passed through: its low-poly body
+    // seen in itself (a door in its own wing) is hard-edged dark patches more than a reflection
+    raytracing::intersector<raytracing::triangle_data> hit;
+    hit.assume_geometry_type(raytracing::geometry_type::triangle);
+    if (trace[7].x != 0) {
+        hit.set_triangle_cull_mode(raytracing::triangle_cull_mode::back);
+        hit.set_triangle_front_facing_winding(trace[7].x == 1 ? winding::clockwise : winding::counterclockwise);
+    }
+    // a hit on itself cast on from just past it, twice at most (the hardware's fast path: no test per candidate)
+    uint self = uint(trace[7].y);
+    float went = 0;
+    auto h = hit.intersect(r, as);
+    for (int k = 0; k < 2 && self != 0 && h.type != raytracing::intersection_type::none && (tri[h.primitive_id * 10 + 9] >> 16) == self; k++) {
+        went += h.distance + 0.01;
+        r.origin = r.origin + d * (h.distance + 0.01);
+        r.max_distance = max(trace[3].y - went, 0.0);
+        h = hit.intersect(r, as);
+    }
+    bool none = h.type == raytracing::intersection_type::none || (self != 0 && (tri[h.primitive_id * 10 + 9] >> 16) == self);
+    float dist = went + h.distance;
+    uint prim = h.primitive_id;
+    float2 b = h.triangle_barycentric_coord;
+    // trace[3].w (XBE_TRACE_DEBUG): 1 hits magenta and misses dark, 2 the hit distance (white near, black at the longest
+    // ray), 3 the hit as shaded and 4 its texture alone (misses dark in both), 5 a perfect mirror of the traced cars alone:
+    // the game's own reflection gone (misses black) and each hit car its lit texture, nothing of the cube on it
+    if (trace[3].w == 1) return none ? float4(env.rgb * 0.25, env.a) : float4(1, 0, 1, env.a);
+    if (trace[3].w == 2) return float4(float3(none ? 0.0 : 1.0 - dist / trace[3].y), env.a);
+    if (none && trace[3].w == 5) return float4(0, 0, 0, env.a);
+    if (none) return trace[3].w >= 3 ? float4(env.rgb * 0.15, env.a) : env;
+    const device uint* t = tri + prim * 10;
+    float3 k = float3(1.0 - b.x - b.y, b.x, b.y);
+    float2 uv = k.x * float2(as_type<half2>(t[0])) + k.y * float2(as_type<half2>(t[1])) + k.z * float2(as_type<half2>(t[2]));
+    float3 hn = k.x * unpack_snorm4x8_to_float(t[3]).xyz + k.y * unpack_snorm4x8_to_float(t[4]).xyz + k.z * unpack_snorm4x8_to_float(t[5]).xyz;
+    float4 lit = k.x * unpack_unorm4x8_to_float(t[6]) + k.y * unpack_unorm4x8_to_float(t[7]) + k.z * unpack_unorm4x8_to_float(t[8]);
+    uint mat = t[9];
+    // the texture's level from how far the ray went: the reflecting surface spreads a pixel's rays wider still
+    constexpr sampler wrap(filter::linear, mip_filter::linear, address::repeat);
+    float4 tx = (mat & 255) < 16 ? stex[mat & 255].sample(wrap, uv, level(clamp(log2(dist) + 1.5, 0.0, 9.0))) : float4(1);
+    if (trace[3].w == 4) return float4(tx.rgb, env.a);
+    if (trace[3].w == 5) return float4(tx.rgb * lit.rgb, env.a);
+    hn = length(hn) > 1e-4 ? normalize(hn) : -d;
+    if (dot(hn, d) > 0) hn = -hn;
+    float fres = pow(1.0 - saturate(-dot(d, hn)), 3.0);
+    float3 there = cube.Sample(sm, reflect(d, hn)).rgb;
+    float shine = (mat & 256) ? lit.a * (0.4 + 0.6 * fres) : lit.a * tx.a * (0.3 + 0.7 * fres);
+    float3 c = tx.rgb * lit.rgb + there * shine;
+    if (trace[3].w == 3) return float4(c, env.a);
+    float fade = saturate((trace[3].y - dist) / (0.3 * trace[3].y));
+    return float4(mix(env.rgb, c, fade), env.a);
 }
 )";
 
@@ -936,6 +1022,12 @@ std::string PixelHlsl(const PixelKey& k) {
         const char* type = t.shadow ? "Texture2D<float>" : t.kind == kTex3D ? "Texture3D" : t.kind == kTexCube ? "TextureCube" : "Texture2D";
         s += F("%s tex%d : register(t%d);\n%s smp%d : register(s%d);\n", type, i, i, t.shadow ? "SamplerComparisonState" : "SamplerState", i, i);
     }
+    for (int i = 0; i < 4; i++)
+        if (k.tex[i].flags & kTexTraced) {
+            s += "TexTrace scene : register(t8);\n";
+            s += kPsTraced;
+            break;
+        }
     if (k.wbuf) {
         // the NV2A's Z_PERSPECTIVE: the pixel's w, the polygon offset in its units and its slope, stored whole (xemu
         // interpolates w linearly on the screen, which puts long triangles reaching the camera in front of everything)
@@ -1026,6 +1118,8 @@ std::string PixelHlsl(const PixelKey& k) {
         body += "cur.rgb = saturate(cur.rgb + v1.rgb);\n";
         body += "float4 outc = float4(lerp(fogin.rgb, cur.rgb, fogin.a), cur.a);\n";
     }
+    for (int i = 0; i < 4; i++)  // XBE_TRACE_DEBUG: the trace's own picture, whatever the combiners make of it
+        if (k.tex[i].flags & kTexTraced) body += F("if (trace[3].w != 0) outc = float4(t%d.rgb, 1);\n", i);
     body += (k.coverage ? F("cov = alphacover(outc.a, %u);\n", k.coverage) : std::string("alphatest(outc.a);\n")) + Hooks().Output() + "return outc;\n}\n";
     s += body;
     return k.quad ? QuadHlsl(std::move(s)) : s;

@@ -546,6 +546,36 @@ private:
     std::chrono::steady_clock::time_point last_present_ = std::chrono::steady_clock::now();
     uint32_t hitch_lines_ = 0;
     std::unordered_map<uint64_t, id<MTLFunction>> fn_vs_, fn_vp_, fn_ps_;
+    // ray traced reflections (DrawAdjust::trace_*): the frame's scene as its draws give it, built at the present into the
+    // slot of the frame drawn next, which traces against it
+    struct TraceSlot {
+        id<MTLBuffer> verts, colours, scratch;
+        id<MTLAccelerationStructure> as;
+        std::vector<id<MTLTexture>> tex;  // scene_tex_ as it was built
+        std::vector<uint32_t> object;     // each draw's object (by DrawAdjust::trace_draw)
+    };
+    TraceSlot trace_[kFramesInFlight];
+    std::vector<float> scene_xyz_;         // three x y z per triangle, in the world
+    // per triangle kTraceWords: three texture coordinates (half2), normals (snorm4x8), lit colours (RGBA8, alpha the
+    // cube's share), then the material: its texture's index in scene_tex_ (255 none) | 256 glass | its object << 16
+    static constexpr size_t kTraceWords = 10, kSceneTextures = 16;
+    std::vector<uint32_t> scene_colour_;
+    std::vector<id<MTLTexture>> scene_tex_;
+    struct SceneDraw {  // by DrawAdjust::trace_draw
+        float lo[3] = {}, hi[3] = {};
+        size_t first = 0, end = 0;  // its triangles
+    };
+    std::vector<SceneDraw> scene_draws_;
+    struct SceneMesh {  // a mesh's triangles as its draws read them (DrawAdjust::trace_mesh), x y z each
+        std::vector<float> xyz, normals, uvs;
+        uint64_t used = 0;  // presents_
+    };
+    std::unordered_map<uint64_t, SceneMesh> scene_meshes_;
+    int trace_live_ = -1;                  // the slot this frame traces against, -1 none
+    bool trace_ok_ = false;                // the device traces rays from fragment functions
+    const DrawAdjust* carried_ = nullptr;  // the filter's answer for a draw drawn again with another stage 3
+    void AddToScene(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, const DrawAdjust& a);
+    void BuildScene();
 };
 
 // ---- device and fixed objects
@@ -600,8 +630,10 @@ bool MetalBackend::Init(uint32_t width, uint32_t height) {
         td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         dummy_depth_ = [dev_ newTextureWithDescriptor:td];
         ui_ = ImGui_ImplMetal_Init(dev_);
+        trace_ok_ = dev_.supportsRaytracing && dev_.supportsRaytracingFromRender;
         OpenCache();
-        LOGR("metal: drawing with %s, %ux%u guest, render scale %.3f", dev_.name.UTF8String, width, height, scale_);
+        LOGR("metal: drawing with %s, %ux%u guest, render scale %.3f%s", dev_.name.UTF8String, width, height, scale_,
+             trace_ok_ ? ", rays traced from fragment shaders" : ", no ray tracing from fragment shaders");
         return true;
     }
 }
@@ -1706,6 +1738,181 @@ id<MTLTexture> MetalBackend::Dummy(const TexInfo& info) {
     return dummy_2d_;
 }
 
+// ---- ray traced reflections
+
+uint64_t g_trace_presents = 0;  // MetalBackend::presents_, for TraceLogFrame
+
+// XBE_TRACE_LOG=frame: that frame's scene and traced draws in the log
+bool TraceLogFrame() {
+    static const uint64_t frame = std::getenv("XBE_TRACE_LOG") ? std::strtoull(std::getenv("XBE_TRACE_LOG"), nullptr, 10) : 0;
+    return frame && g_trace_presents == frame;
+}
+
+// a draw's triangles into the frame's scene, in the world, with what shades a hit on each (DrawAdjust::trace_scene)
+void MetalBackend::AddToScene(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, const DrawAdjust& a) {
+    constexpr size_t kMaxTriangles = 1u << 20;
+    if (!trace_ok_ || scene_colour_.size() >= kMaxTriangles * kTraceWords) return;
+    const size_t from = scene_xyz_.size();
+    // the mesh's vertices read once (a car's meshes stay as they are), kept while drawn
+    thread_local SceneMesh fresh;
+    SceneMesh* mesh = nullptr;
+    if (a.trace_mesh) {
+        auto it = scene_meshes_.find(a.trace_mesh);
+        if (it != scene_meshes_.end()) mesh = &it->second;
+    }
+    if (!mesh) {
+        fresh.xyz.clear(), fresh.normals.clear(), fresh.uvs.clear();
+        if (!DrawTriangles(s, prim, start, count, indices, 0, fresh.xyz)) return;
+        if (!DrawTriangles(s, prim, start, count, indices, 1, fresh.normals) || fresh.normals.size() != fresh.xyz.size()) fresh.normals.clear();
+        if (!DrawTriangles(s, prim, start, count, indices, 2, fresh.uvs) || fresh.uvs.size() != fresh.xyz.size()) fresh.uvs.clear();
+        if (scene_meshes_.size() > 4096) scene_meshes_.clear();
+        mesh = a.trace_mesh ? &(scene_meshes_[a.trace_mesh] = fresh) : &fresh;
+    }
+    mesh->used = presents_;
+    scene_xyz_.insert(scene_xyz_.end(), mesh->xyz.begin(), mesh->xyz.end());
+    const std::vector<float>& normals = mesh->normals;
+    const std::vector<float>& uvs = mesh->uvs;
+    const size_t n_verts = mesh->xyz.size() / 3;
+    const bool have_n = !normals.empty();
+    const bool have_uv = a.trace_uv != 0 && !uvs.empty();
+    const float* m = a.trace_world;
+    for (size_t i = from; i + 2 < scene_xyz_.size(); i += 3) {
+        const float x = scene_xyz_[i], y = scene_xyz_[i + 1], z = scene_xyz_[i + 2];
+        for (int r = 0; r < 3; r++) scene_xyz_[i + size_t(r)] = m[r * 4] * x + m[r * 4 + 1] * y + m[r * 4 + 2] * z + m[r * 4 + 3];
+    }
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+    for (size_t i = from; i + 2 < scene_xyz_.size(); i += 3)
+        for (int k = 0; k < 3; k++) lo[k] = std::min(lo[k], scene_xyz_[i + size_t(k)]), hi[k] = std::max(hi[k], scene_xyz_[i + size_t(k)]);
+    if (a.trace_draw < 4096) {
+        if (scene_draws_.size() <= a.trace_draw) scene_draws_.resize(a.trace_draw + 1);
+        SceneDraw& sd = scene_draws_[a.trace_draw];
+        std::memcpy(sd.lo, lo, sizeof lo);
+        std::memcpy(sd.hi, hi, sizeof hi);
+        sd.first = scene_colour_.size() / kTraceWords;
+        sd.end = sd.first + n_verts / 3;
+    }
+    if (TraceLogFrame()) {
+        LOGR("trace scene: vs %08X rt %08X %zu triangles, x %.2f %.2f y %.2f %.2f z %.2f %.2f, normals %d uvs %d", s.vs_handle, s.rt.data,
+             n_verts / 3, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], int(have_n), int(have_uv));
+    }
+    // the material: stage 0's texture, one of the frame's few
+    uint32_t material = 255;
+    if (have_uv && !a.trace_glass) {
+        DrawTextures stages{};
+        id<MTLTexture> tex = BindTexture(s, 0, stages);
+        if (tex && tex.textureType == MTLTextureType2D) {
+            auto it = std::find(scene_tex_.begin(), scene_tex_.end(), tex);
+            if (it != scene_tex_.end()) material = uint32_t(it - scene_tex_.begin());
+            else if (scene_tex_.size() < kSceneTextures) material = uint32_t(scene_tex_.size()), scene_tex_.push_back(tex);
+        }
+    }
+    if (a.trace_glass) material |= 256;
+    auto byte = [](float v) { return uint32_t(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); };
+    auto snorm = [](float v) { return uint32_t(int32_t(std::lround(std::clamp(v, -1.0f, 1.0f) * 127.0f)) & 0xFF); };
+    auto half = [](float v) {
+        const _Float16 h = _Float16(std::clamp(v, -60000.0f, 60000.0f));
+        uint16_t b;
+        std::memcpy(&b, &h, 2);
+        return uint32_t(b);
+    };
+    const float* l = a.trace_light;
+    const float* c = a.trace_colour;
+    for (size_t v = 0; v + 2 < n_verts; v += 3) {
+        const float* p = &scene_xyz_[from + v * 3];
+        const float e1[3] = {p[3] - p[0], p[4] - p[1], p[5] - p[2]}, e2[3] = {p[6] - p[0], p[7] - p[1], p[8] - p[2]};
+        const float face[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+        uint32_t w[kTraceWords];
+        for (int k = 0; k < 3; k++) {
+            float n[3];
+            if (have_n) {
+                const float* o = &normals[(v + size_t(k)) * 3];
+                for (int r = 0; r < 3; r++) n[r] = m[r * 4] * o[0] + m[r * 4 + 1] * o[1] + m[r * 4 + 2] * o[2];
+            } else std::memcpy(n, face, sizeof n);
+            const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+            if (len > 0) n[0] /= len, n[1] /= len, n[2] /= len;
+            const float nl = n[0] * l[0] + n[1] * l[1] + n[2] * l[2];
+            const float lit = l[3] + (1 - l[3]) * (have_n ? std::max(nl, 0.0f) : std::fabs(nl));
+            w[k] = have_uv ? half(uvs[(v + size_t(k)) * 3] * a.trace_uv) | half(uvs[(v + size_t(k)) * 3 + 1] * a.trace_uv) << 16 : 0;
+            w[3 + k] = snorm(n[0]) | snorm(n[1]) << 8 | snorm(n[2]) << 16;
+            w[6 + k] = byte(c[0] * lit) | byte(c[1] * lit) << 8 | byte(c[2] * lit) << 16 | byte(c[3]) << 24;
+        }
+        w[9] = material;  // the object: BuildScene
+        scene_colour_.insert(scene_colour_.end(), w, w + kTraceWords);
+    }
+}
+
+// the frame's scene into the slot the next frame draws with (its last use done: Present waited for it)
+void MetalBackend::BuildScene() {
+    trace_live_ = -1;
+    const uint32_t tris = uint32_t(scene_colour_.size() / kTraceWords);
+    if (trace_ok_ && tris) {
+        TraceSlot& t = trace_[frame_slot_];
+        // the draws grouped into objects (a car's body, wheels, lights and glass): the largest first, each other joining
+        // the first whose bounds (30 cm wider) hold its centre
+        std::vector<uint32_t> order(scene_draws_.size());
+        for (uint32_t i = 0; i < order.size(); i++) order[i] = i;
+        std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+            return scene_draws_[a].end - scene_draws_[a].first > scene_draws_[b].end - scene_draws_[b].first;
+        });
+        t.object.assign(scene_draws_.size(), 0);
+        std::vector<uint32_t> heads;
+        for (uint32_t i : order) {
+            const SceneDraw& d = scene_draws_[i];
+            if (d.end == d.first) continue;
+            const float c[3] = {(d.lo[0] + d.hi[0]) / 2, (d.lo[1] + d.hi[1]) / 2, (d.lo[2] + d.hi[2]) / 2};
+            for (uint32_t h : heads) {
+                const SceneDraw& b = scene_draws_[h];
+                bool in = true;
+                for (int k = 0; k < 3; k++) in &= c[k] >= b.lo[k] - 0.3f && c[k] <= b.hi[k] + 0.3f;
+                if (in) {
+                    t.object[i] = t.object[h];
+                    break;
+                }
+            }
+            if (!t.object[i]) heads.push_back(i), t.object[i] = uint32_t(std::min<size_t>(heads.size(), 0xFFFF));
+            for (size_t k = d.first; k < d.end; k++) scene_colour_[k * kTraceWords + 9] |= t.object[i] << 16;
+        }
+        const size_t vbytes = size_t(tris) * 36, cbytes = size_t(tris) * kTraceWords * 4;
+        if (!t.verts || t.verts.length < vbytes) t.verts = [dev_ newBufferWithLength:vbytes * 3 / 2 options:MTLResourceStorageModeShared];
+        if (!t.colours || t.colours.length < cbytes) t.colours = [dev_ newBufferWithLength:cbytes * 3 / 2 options:MTLResourceStorageModeShared];
+        std::memcpy(t.verts.contents, scene_xyz_.data(), vbytes);
+        std::memcpy(t.colours.contents, scene_colour_.data(), cbytes);
+        MTLAccelerationStructureTriangleGeometryDescriptor* g = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+        g.vertexBuffer = t.verts;
+        g.vertexStride = 12;
+        g.triangleCount = tris;
+        g.opaque = YES;
+        MTLPrimitiveAccelerationStructureDescriptor* d = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+        d.geometryDescriptors = @[ g ];
+        d.usage = MTLAccelerationStructureUsagePreferFastBuild;
+        const MTLAccelerationStructureSizes sz = [dev_ accelerationStructureSizesWithDescriptor:d];
+        if (!t.as || t.as.size < sz.accelerationStructureSize) t.as = [dev_ newAccelerationStructureWithSize:sz.accelerationStructureSize * 3 / 2];
+        if (!t.scratch || t.scratch.length < sz.buildScratchBufferSize)
+            t.scratch = [dev_ newBufferWithLength:std::max<NSUInteger>(sz.buildScratchBufferSize * 3 / 2, 256) options:MTLResourceStorageModePrivate];
+        if (t.as && t.scratch) {
+            EndEncoder();
+            id<MTLAccelerationStructureCommandEncoder> e = [Cb() accelerationStructureCommandEncoder];
+            [e buildAccelerationStructure:t.as descriptor:d scratchBuffer:t.scratch scratchBufferOffset:0];
+            [e endEncoding];
+            trace_live_ = frame_slot_;
+            t.tex = scene_tex_;
+        }
+        static bool told = false;
+        if (!told) {
+            told = true;
+            LOGR("metal: ray traced reflections: the first scene has %u triangles", tris);
+        }
+    }
+    scene_xyz_.clear();
+    scene_colour_.clear();
+    scene_tex_.clear();
+    scene_draws_.clear();
+    // meshes not drawn for ten seconds dropped
+    if (presents_ % 600 == 0)
+        for (auto it = scene_meshes_.begin(); it != scene_meshes_.end();)
+            it = presents_ - it->second.used > 600 ? scene_meshes_.erase(it) : std::next(it);
+}
+
 // ---- the draw
 
 void MetalBackend::EnsureVertexShader(const State& s, const Assembled& a, DrawShaders& sh) {
@@ -1983,11 +2190,22 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         if (diag::SkippedDraw(s.vs_handle)) return;
         DrawAdjust adjust;
         adjust.start = start, adjust.count = count, adjust.indices = indices;
+        adjust.frame = presents_;
+        if (g_draw_filtered && carried_ && carried_->trace_reflect) {  // drawn again with another stage 3: still traced
+            adjust.trace_reflect = true;
+            std::memcpy(adjust.trace_from, carried_->trace_from, sizeof(adjust.trace_from));
+            std::memcpy(adjust.trace_turn, carried_->trace_turn, sizeof(adjust.trace_turn));
+            std::memcpy(adjust.trace_range, carried_->trace_range, sizeof(adjust.trace_range));
+            adjust.trace_self = carried_->trace_self;
+        }
         if (g_draw_filter && !g_draw_filtered) g_draw_filter(s, adjust);
         if (adjust.skip) return;
+        if (adjust.trace_scene) AddToScene(s, prim, start, count, indices, adjust);
         if (adjust.stage3) {
             g_draw_filtered = true;
+            carried_ = &adjust;
             Draw(*WithStage3(s, adjust.stage3), prim, start, count, indices);
+            carried_ = nullptr;
             g_draw_filtered = false;
             return;
         }
@@ -2008,6 +2226,14 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         if (!BindTargets(s)) return;
         PixelKey pk = MakePixelKey(s, stages.info);
         pk.quad = sh.quad;
+        const bool traced = adjust.trace_reflect && trace_live_ >= 0 && pk.programmable && pk.tex[3].kind == kTexCube && !pk.tex[3].shadow;
+        if (TraceLogFrame() && adjust.trace_reflect)
+            LOGR("trace draw: vs %08X rt %08X %s (scene %d, self %u of %zu -> object %u, programmable %u, stage 3 kind %u) from %.4g %.4g %.4g %.4g / %.4g %.4g %.4g %.4g / %.4g %.4g %.4g %.4g",
+                 s.vs_handle, s.rt.data, traced ? "traced" : "not traced", trace_live_, adjust.trace_self, trace_live_ >= 0 ? trace_[trace_live_].object.size() : 0,
+                 trace_live_ >= 0 && adjust.trace_self && adjust.trace_self <= trace_[trace_live_].object.size() ? trace_[trace_live_].object[adjust.trace_self - 1] : 0, pk.programmable, pk.tex[3].kind, adjust.trace_from[0],
+                 adjust.trace_from[1], adjust.trace_from[2], adjust.trace_from[3], adjust.trace_from[4], adjust.trace_from[5], adjust.trace_from[6],
+                 adjust.trace_from[7], adjust.trace_from[8], adjust.trace_from[9], adjust.trace_from[10], adjust.trace_from[11]);
+        if (traced) pk.tex[3].flags |= kTexTraced;
         // D3DZB_USEW draws write w as their depth, as the console does; XBE_WBUFFER=0 goes back to z / w
         static const bool wbuffer = [] {
             const char* e = std::getenv("XBE_WBUFFER");
@@ -2060,7 +2286,31 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             if (span == kSpanViewport) c.hud[0] = 1;      // a pass filling its own viewport
         }
         SqueezeBeyond(s, c.hud);
+        if (traced) {
+            // the filter's place in the scene from console pixels, here from the target's own (as the scissor below scales)
+            const Target* tb = bound_rt_ ? bound_rt_ : bound_ds_;
+            const float px = float(tb->w) / size.w, py = float(tb->h) / size.h;  // as the vertex shader's surf maps them
+            for (int r = 0; r < 3; r++) {
+                const float* f = adjust.trace_from + r * 4;
+                c.trace[r][0] = f[0] / px, c.trace[r][1] = f[1] / py, c.trace[r][2] = f[2], c.trace[r][3] = f[3];
+                std::memcpy(c.trace[4 + r], adjust.trace_turn + r * 4, 16);
+            }
+            c.trace[3][0] = 1, c.trace[3][1] = adjust.trace_range[0], c.trace[3][2] = adjust.trace_range[1];
+            static const float debug = std::getenv("XBE_TRACE_DEBUG") ? float(std::atoi(std::getenv("XBE_TRACE_DEBUG"))) : 0.0f;
+            c.trace[3][3] = debug;
+            // the triangles' faces: anticlockwise in front, as PGR2's cars are wound (XBE_TRACE_CULL=0 none, 1 clockwise)
+            static const float cull = std::getenv("XBE_TRACE_CULL") ? float(std::atoi(std::getenv("XBE_TRACE_CULL"))) : 2.0f;
+            c.trace[7][0] = cull;
+            const auto& object = trace_[trace_live_].object;
+            c.trace[7][1] = adjust.trace_self && adjust.trace_self <= object.size() ? float(object[adjust.trace_self - 1]) : 0.0f;
+        }
         UploadConstants(s, sh, k, stages, size, c);
+        if (traced) {
+            [enc_ setFragmentAccelerationStructure:trace_[trace_live_].as atBufferIndex:1];
+            [enc_ setFragmentBuffer:trace_[trace_live_].colours offset:0 atIndex:2];
+            const auto& tex = trace_[trace_live_].tex;
+            for (size_t i = 0; i < kSceneTextures; i++) [enc_ setFragmentTexture:i < tex.size() ? tex[i] : dummy_2d_ atIndex:8 + i];
+        }
 
         // textures and samplers
         bool clamp = UnitTexcoords(a);
@@ -2272,8 +2522,10 @@ void MetalBackend::Present(const Surface& front) {
         ring_ = rings_[frame_slot_];
         ring_used_ = 0;
         const_last_.clear();
+        BuildScene();
         DeliverReports();
         presents_++;
+        g_trace_presents = presents_;
         presents_seen_.store(presents_);
         // a hitch, and where the frame's time went: what is left over is the title's own code, or waiting on the GPU
         const auto now = std::chrono::steady_clock::now();
