@@ -8,6 +8,7 @@
 // zeros) within 30 frames, then memdump is removed
 // poke in the run folder: lines "address size value" (hex address, size 1 2 or 4, value decimal or 0x hex) written to
 // guest memory at the next present, then poke is removed (to meet a condition by hand: achievements)
+#include <map>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +49,7 @@ public:
             g_draw_filter(s, adjust);
         }
         if (drawing_) reference::Draw(s, prim, start, count, indices);
+        if (drawing_ && s.rt.data && targets_.size() < 64) targets_.emplace(s.rt.data, s.rt);
         if (list_) List(s, prim, start, count);
         harness::AuditDraw(s, prim, start, count, indices);
     }
@@ -63,6 +65,16 @@ public:
         if (draws_ == last_draws_) empty_++;
         last_draws_ = draws_;
         if (drawing_ && !snap_) reference::WriteTga(front, File("cap/ref_%05llu.tga", frames_).c_str());
+        // REF_TARGETS=1: every other target drawn in that frame too (reflection cube faces, the light pool), by its data
+        static const bool targets = harness::Env("REF_TARGETS", 0) != 0;
+        if (drawing_ && targets)
+            for (auto& [data, rt] : targets_)
+                if (data != front.data) {
+                    char name[64];
+                    std::snprintf(name, sizeof name, "cap/ref_%05llu_%08X.tga", frames_, data);
+                    reference::WriteTga(rt, (app::ExeDir() / name).string().c_str());
+                }
+        targets_.clear();
         // snap asks for the next frames drawn: two, or SNAP_FRAMES
         std::string snap = (app::ExeDir() / "snap").string();
         static const long snaps = std::max(2L, harness::Env("SNAP_FRAMES", 2));
@@ -207,6 +219,7 @@ private:
 
     unsigned long long frames_ = 0, draws_ = 0, last_draws_ = 0, empty_ = 0;
     bool drawing_ = false;
+    std::map<uint32_t, Surface> targets_;  // REF_TARGETS: the targets drawn in this frame
     int snap_ = 0;
     FILE* list_ = nullptr;
 };
