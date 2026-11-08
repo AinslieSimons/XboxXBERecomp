@@ -35,6 +35,7 @@ struct VOut {
     float4 tc3 : TEXCOORD3;
     float fogamt : TEXCOORD4;
     float wlin : TEXCOORD6;  // w, interpolated perspective correct: the pixel's own
+    float2 clipz : SV_ClipDistance0;  // zclip
     float psize : TEXCOORD7;  // a point's size in console pixels (oPts), 0 for the render state's
 };
 cbuffer VC : register(b0) { float4 c[192]; };
@@ -63,6 +64,8 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 wdepth;
     float4 hud;
     float4 pts;  // point sprites on, size min, size max, D3DRS_POINTSIZE
+    float4 vattr[16];  // the v registers a draw gives no stream
+    float4 zclip;  // the depth clip planes
     float4 trace[8];  // kTexTraced
 };
 )";
@@ -142,7 +145,7 @@ std::string Src(const Tok& k, int which, uint16_t regs) {
         base = reg == 12 ? "oPos" : F("R%u", reg);
     } else if (mux == 2) {
         uint32_t v = k.f(1, 9, 4);
-        base = (regs >> v) & 1 ? F("i.v%u", v) : (v == 3 ? "float4(1,1,1,1)" : "float4(0,0,0,1)");
+        base = (regs >> v) & 1 ? F("i.v%u", v) : F("vattr[%u]", v);
     } else {
         uint32_t cr = k.f(1, 13, 8);
         base = k.f(3, 1, 1) ? F("c[clamp(a0 + %u, 0, 191)]", cr) : F("c[%u]", cr);
@@ -245,6 +248,7 @@ const char* kVsEpilogue = R"(
     q.xyz *= p.w;
     q.w = p.w;
     o.pos = q;
+    o.clipz = float2(q.z - zclip.x * q.w, zclip.y * q.w - q.z);
     o.d0 = saturate(oD0);
     o.d1 = saturate(oD1);
     o.b0 = saturate(oB0);
@@ -508,13 +512,16 @@ void alphatest(float a) {
     if (!ok) discard;
 }
 // a greater-than alpha test as coverage over a pixel's width of alpha, for an MSAA target; other tests stay as they are.
-// The alpha written does not change. Texels with no alpha at all stay out, whatever the reference
+// The alpha written does not change. Texels with no alpha at all stay out, whatever the reference, except under
+// greater-or-equal 0, which passes everything (PGR2 draws with it, in Washington among others: its alpha 0 texels
+// went missing with Smooth alpha edges on)
 uint alphacover(float a, uint samples) {
     int f = (int)misc.y;
     if (f != 4 && f != 6) {
         alphatest(a);
         return 0xFFFFFFFF;
     }
+    if (f == 6 && misc.x <= 0) return 0xFFFFFFFF;
     float c = saturate((a - misc.x / 255) / max(fwidth(a), 1e-3) + 0.5);
     if (a <= 0 || c <= 0) discard;
     uint n = min((uint)ceil(c * samples), samples);
@@ -997,6 +1004,7 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
     if (surf.w == 0 && abs(sp.y - (surf.y - 0.5)) < 1e-3) cp.y = -cp.w;
     if (hud.w != 0) cp.z = min(cp.z, cp.w);  // W-buffered: nothing clipped past the far plane (the programs' epilogue)
     o.pos = cp;
+    o.clipz = float2(cp.z - zclip.x * cp.w, zclip.y * cp.w - cp.z);
     o.d0 = saturate(oD0);
     o.d1 = saturate(oD1);
     o.b0 = o.d0;
@@ -1040,7 +1048,9 @@ std::string PixelHlsl(const PixelKey& k) {
     }
     s += "    float4 tc0 = i.tc0, tc1 = i.tc1, tc2 = i.tc2, tc3 = i.tc3;\n";
     s += k.two_sided ? "    float4 v0 = front ? i.d0 : i.b0, v1 = front ? i.d1 : i.b1;\n" : "    float4 v0 = i.d0, v1 = i.d1;\n";
-    s += "    if (misc.w == 0) v1 = float4(0, 0, 0, 1);\n";
+    // D3DRS_SPECULARENABLE off: no specular added at the end; a texture stage's D3DTA_SPECULAR still reads it (True Crime's
+    // facades light the wall texture by it). A pixel shader's v1 stays 0 as before.
+    if (k.programmable) s += "    if (misc.w == 0) v1 = float4(0, 0, 0, 1);\n";
     s += "    float4 fogin = float4(fogcolor.rgb, saturate(i.fogamt));\n";
     std::string body;
     if (k.programmable) {
@@ -1105,7 +1115,7 @@ std::string PixelHlsl(const PixelKey& k) {
             else if (t.kind == kTex2D) body += F("float4 t%d = tex%d.Sample(smp%d, %s);\n", i, i, i, uv.c_str());
             else if (t.kind == kTexCube && !(cube = Hooks().Cube(t, i, F("tc%d.xyz", i))).empty()) body += F("float4 t%d = %s;\n", i, cube.c_str());
             else if (t.kind) body += F("float4 t%d = tex%d.Sample(smp%d, tc%d.xyz);\n", i, i, i, i);
-            else body += F("float4 t%d = float4(1,1,1,1);\n", i);
+            else body += F("float4 t%d = float4(%s);\n", i, app::kGame.unbound_texture_zero ? "0,0,0,0" : "1,1,1,1");
             body += Hooks().Fetched(t, i);
             if (t.flags & kTexDepthBytes) body += F("t%d = depthbytes(t%d.r, %d);\n", i, i, DepthBytesArg(t.flags));
             if (t.flags & kTexOpaque) body += F("t%d.a = 1;\n", i);
@@ -1115,7 +1125,7 @@ std::string PixelHlsl(const PixelKey& k) {
             std::string a = f[4] <= 1 ? std::string("cur.a") : FfOp(f[4], FfArg(f[5], i, true), FfArg(f[6], i, true), FfArg(f[7], i, true), i, true);
             body += F("{ float3 c3 = saturate(%s); float c1 = saturate(%s); %s = float4(c3, c1); }\n", rgb.c_str(), a.c_str(), dst);
         }
-        body += "cur.rgb = saturate(cur.rgb + v1.rgb);\n";
+        body += "if (misc.w != 0) cur.rgb = saturate(cur.rgb + v1.rgb);\n";
         body += "float4 outc = float4(lerp(fogin.rgb, cur.rgb, fogin.a), cur.a);\n";
     }
     for (int i = 0; i < 4; i++)  // XBE_TRACE_DEBUG: the trace's own picture, whatever the combiners make of it
@@ -1174,6 +1184,35 @@ void main(point VOut v[1], inout TriangleStream<VOut> strip) {
         VOut o = v[0];
         o.pos.x += (i & 1) ? half_pixel.x : -half_pixel.x - back.x;
         o.pos.y += (i & 2) ? -half_pixel.y : half_pixel.y + back.y;
+        strip.Append(o);
+    }
+}
+)";
+}
+
+// a line covers one console pixel across, several host pixels on an upscaled target: drawn as a quad that wide. The
+// console's pixel k has its centre at k, so a line at k covers pixel k, which here spans k to k+1 (the transform maps
+// k to the pixel's near edge): the quad runs half a pixel right and down of the line, half a pixel either side, each
+// pixel from the first to the last (a line from 0 to 255 fills 0 to 256). Drawn one host pixel wide at the console's
+// coordinates, a line along a target's top or left edge (0) covered nothing and one along its far edges (255) missed
+// the last host rows: True Crime clears its shadow map's border with four such lines, and a clamped read past an edge
+// kept its shadow, so the wet road's sheen ended in a dark band ahead of the player (which edge, by the way he faced).
+std::string LineHlsl() {
+    return Common() + R"(
+[maxvertexcount(4)]
+void main(line VOut v[2], inout TriangleStream<VOut> strip) {
+    if (v[0].pos.w <= 0 || v[1].pos.w <= 0) return;  // crosses the eye plane: left out
+    float2 a = v[0].pos.xy / v[0].pos.w, b = v[1].pos.xy / v[1].pos.w;
+    float2 px = surf.xy * 0.5;  // console pixels per clip unit
+    float2 d = (b - a) * px;
+    float n2 = dot(d, d);
+    d = n2 > 1e-12 ? d * rsqrt(n2) : float2(1, 0);
+    float2 along = d / px * 0.5, across = float2(-d.y, d.x) / px * 0.5;  // half a console pixel, in clip units
+    float2 centre = float2(0.5, -0.5) / px;  // half a pixel right and down (clip y is up)
+    for (int i = 0; i < 4; i++) {
+        VOut o = v[i >> 1];
+        float2 c = ((i >> 1) ? b + along : a - along) + centre + ((i & 1) ? -across : across);
+        o.pos.xy = c * o.pos.w;
         strip.Append(o);
     }
 }

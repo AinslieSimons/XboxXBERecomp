@@ -775,7 +775,7 @@ struct Combiners {
             if (!Fetch(i, dp)) return false;
         const PixelKey& k = m.key;
         v0 = f.v0;
-        v1 = f.v1;
+        v1 = m.s->rs[kRsSpecularEnable] ? f.v1 : V(0, 0, 0, 1);
         r0 = V(0, 0, 0, (k.tex_modes & 0x1F) ? t[0][3] : 1);
         r1 = Vec{};
         uint32_t n = std::min<uint32_t>(k.count & 0xFF, 8);
@@ -910,7 +910,8 @@ bool ShadeStages(const Material& m, const Fragment& f, Vec& out) {
         }
         (st[8] == 5 ? tmp : cur) = r;
     }
-    for (int j = 0; j < 3; j++) cur[j] = Sat(cur[j] + f.v1[j]);
+    if (m.s->rs[kRsSpecularEnable])  // the specular added only when enabled; D3DTA_SPECULAR reads it regardless
+        for (int j = 0; j < 3; j++) cur[j] = Sat(cur[j] + f.v1[j]);
     for (int j = 0; j < 3; j++) out[j] = f.fog[j] * (1 - f.fog[3]) + cur[j] * f.fog[3];
     out[3] = cur[3];
     return true;
@@ -1257,6 +1258,13 @@ void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const u
     if ((as.pretransformed || screen) && slot[0] >= 0 && rt.ok && (rt.h == 480 || rt.h == 576) && rt.w >= rt.h &&
         app::FrameAspect() > app::kGame.hud_aspect + 1e-3f)
         squeeze = app::kGame.hud_aspect / app::FrameAspect();
+    // State::pillar_aspect: squeezed whole to that shape (the renderers' Pillarbox)
+    const bool pillar = s.pillar_aspect > 0 && (as.pretransformed || screen) && slot[0] >= 0 && rt.ok &&
+                        (rt.h == 480 || rt.h == 576) && rt.w >= rt.h && app::FrameAspect() > s.pillar_aspect + 1e-3f &&
+                        (!s.pillar_format ||
+                         (s.textures[0] && (kernel::R32(s.textures[0] + 12) >> 8 & 0xFF) == s.pillar_format));
+    const float hud_squeeze = squeeze;  // what a pillar draw not spanning the frame keeps
+    if (pillar) squeeze = s.pillar_aspect / app::FrameAspect();
     std::vector<uint8_t> squeezable(as.vertex_count, 0);  // squeezed below, once the draw's extent is known
     for (uint32_t vi = 0; vi < as.vertex_count; vi++) {
         VertexProgram vp{s};
@@ -1265,7 +1273,8 @@ void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const u
                 const float* p = input(vi, r);
                 vp.in[r] = V(p[0], p[1], p[2], p[3]);
             } else {
-                vp.in[r] = r == 3 ? V(1, 1, 1, 1) : V(0, 0, 0, 1);
+                const auto& p = s.vattr[size_t(r)];
+                vp.in[r] = V(p[0], p[1], p[2], p[3]);
             }
         }
         Shaded& o = verts[vi];
@@ -1329,7 +1338,6 @@ void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const u
         }
         for (int a : {kD0, kD1, kB0, kB1})
             for (int j = 0; j < 4; j++) o.attr[a][j] = Sat(o.attr[a][j]);
-        if (!s.rs[kRsSpecularEnable]) o.attr[kD1] = o.attr[kB1] = V(0, 0, 0, 1);
         // drawn in pixels of aa_x by aa_y target pixels (State::aa_x)
         o.pos[0] *= float(s.aa_x);
         o.pos[1] *= float(s.aa_y);
@@ -1338,24 +1346,27 @@ void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const u
     // where they are; any other is squeezed whole (EoN's driving radar: big tiles past the left edge only)
     // (positions here are already in aa_x pixels; the squeeze works in the draw's own, as it did per vertex)
     float clip_squeeze = 1;  // squeezed whole: the viewport and scissor go with the picture (gpu::SqueezedX)
+    const float pivot = float(rt.w) * 0.5f;  // what the squeeze is about
     if (squeeze != 1) {
         const float ax = float(s.aa_x), w = float(rt.w);
         float lo = 1e30f, hi = -1e30f;
         for (uint32_t vi = 0; vi < as.vertex_count; vi++)
             if (squeezable[vi]) lo = std::min(lo, verts[vi].pos[0] / ax), hi = std::max(hi, verts[vi].pos[0] / ax);
         // State::squeeze_beyond: squeezed whole and moved by squeeze_shift
-        bool spans = !s.squeeze_beyond && ((lo <= 0.5f && hi >= w - 0.5f) ||
+        const bool pillared = pillar && lo <= 0.5f && hi >= w - 0.5f;  // only what spans the frame (the renderers' Pillarbox)
+        if (pillar && !pillared) squeeze = hud_squeeze;
+        bool spans = !s.squeeze_beyond && !pillared && ((lo <= 0.5f && hi >= w - 0.5f) ||
                                            // an untextured fill ending on one edge (the renderers' DrawSpan)
                                            (!s.textures[0] && lo >= -2.0f && hi <= w + 2.0f && (lo <= 0.5f || hi >= w - 0.5f)));
         const float shift = s.squeeze_beyond ? s.squeeze_shift : 0.0f;
         // a pass filling a viewport narrower than the frame (EoN's Thermovision into a 320x240 corner): not squeezed
         const float left = s.viewport.x, right = s.viewport.x + s.viewport.w;
-        if (!s.squeeze_beyond && !spans && right - left < w - 1 && lo <= left + 0.5f && hi >= right - 0.5f) squeeze = 1;
+        if (!s.squeeze_beyond && !pillared && !spans && right - left < w - 1 && lo <= left + 0.5f && hi >= right - 0.5f) squeeze = 1;
         if (!spans) clip_squeeze = squeeze;
         for (uint32_t vi = 0; vi < as.vertex_count; vi++) {
             float x = verts[vi].pos[0] / ax;
             if (squeezable[vi] && !(spans && AtFrameEdge(x, w)))
-                verts[vi].pos[0] = (w * 0.5f + (x + shift - w * 0.5f) * squeeze) * ax;
+                verts[vi].pos[0] = (pivot + (x + shift - pivot) * squeeze) * ax;
         }
     }
 
@@ -1476,7 +1487,7 @@ void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const u
         bottom = std::min(bottom, int(s.scissors[3]));
     }
     if (clip_squeeze != 1) {
-        const float c = float(rt.w) * 0.5f;
+        const float c = pivot;
         const float moved = s.squeeze_beyond ? s.squeeze_shift : 0.0f;  // the clip goes with the moved picture
         left = int(c + (float(left) + moved - c) * clip_squeeze);
         right = int(c + (float(right) + moved - c) * clip_squeeze + 0.999f);
@@ -1598,6 +1609,7 @@ void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const u
                     // put long triangles that reach the camera in front of everything)
                     float z = wbuf ? wk / (b0 * p0.iw + b1 * p1.iw + b2 * p2.iw) : b0 * zv0 + b1 * zv1 + b2 * zv2;
                     if (z < 0 || (!wbuf && z > s.zscale)) continue;
+                    if (s.depth_clip && (z < s.depth_clip_near || z > s.depth_clip_far)) continue;
                     z = std::clamp(z + zoff + float(adjust.depth_bias) * s.zscale / 16777215.0f, 0.0f, s.zscale);
                     float iw = b0 * p0.iw + b1 * p1.iw + b2 * p2.iw;
                     Vec attr[kAttrs];

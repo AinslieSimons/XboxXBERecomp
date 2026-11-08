@@ -163,8 +163,23 @@ struct Surface {
     uint32_t data = 0, format = 0, size = 0;
 };
 
+// a v register's value before a title sets one: colours 1, the rest 0 0 0 1
+inline std::array<std::array<float, 4>, 16> DefaultVertexAttributes() {
+    std::array<std::array<float, 4>, 16> a{};
+    for (size_t r = 0; r < a.size(); r++) a[r] = r == 3 ? std::array<float, 4>{1, 1, 1, 1} : std::array<float, 4>{0, 0, 0, 1};
+    return a;
+}
+
 struct State {
     std::array<uint32_t, 0x800> simple{};  // simple render states indexed by method / 4
+    // the value a v register holds when a draw gives it no stream: the last one pushed (SetVertexData4f and its kin), which
+    // the hardware keeps (True Crime sets v3 and v4 to 1 before its meshes and relies on them: its health bars were black)
+    // (here, between simple and textures: render_thread.cpp sends State in ranges, and a field outside them never arrives)
+    std::array<std::array<float, 4>, 16> vattr = DefaultVertexAttributes();
+    // SetDepthClipPlanes for vertex programs, in depth buffer units, when a title has set them: outside them nothing draws
+    // (True Crime's far city is clipped this way short of the camera, or it covers the buildings near it)
+    bool depth_clip = false;
+    float depth_clip_near = 0, depth_clip_far = 0;
     std::array<uint32_t, kRsMax> rs{};     // deferred and complex render states by D3DRS
     std::array<std::array<uint32_t, kTssCount>, 4> tss{};
     std::array<uint32_t, 4> textures{};    // guest D3DBaseTexture pointers
@@ -210,6 +225,11 @@ struct State {
     // ultrawide it showed at the sides, or a stale picture did without it (the title clears nothing)
     uint32_t blank_format = 0;
     float squeeze_shift = 0;
+    // a game hook draws full screen 2D of this shape (a 4:3 movie: 4/3; 0 none): screen space draws spanning the frame, and
+    // with pillar_format set only those whose stage 0 texture has that format (the header's format byte), are squeezed
+    // whole to it about the centre, pillarboxed instead of stretched across a wider frame
+    float pillar_aspect = 0;
+    uint32_t pillar_format = 0;
     // ultrawide: the 2D being drawn is drawn past the frame's edge by a game hook to fill a margin of the squeezed picture:
     // clipped to that margin instead of the squeezed viewport (-1 left, 1 right, 0 no)
     int squeeze_margin = 0;

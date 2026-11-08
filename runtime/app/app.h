@@ -239,10 +239,19 @@ struct GameInfo {
     bool merge_draws = false;
     // the aspect setting's "from the screen's shape" follows an ultrawide screen instead of stopping at 16:9
     bool auto_fills_screen = false;
+    // the title's 3D views follow FrameAspect when it changes (PGR2 reshapes its cameras): in a widescreen boot, a choice
+    // between 16:9 and filling the screen applies at once; 4:3 against widescreen still waits for the next start
+    bool fill_follows_live = false;
     // a title's music decoded to PCM streams against its other sounds, read on the audio thread at each mix (effects the
     // DSP image would have balanced drown it out): the level of PCM streams and of every other voice; none is full level
     float (*pcm_stream_level)() = nullptr;
     float (*other_voice_level)() = nullptr;
+    // the title's 3D sound positions have +x to the left (DirectSound's is to the right): Project Gotham Racing's head relative
+    // ones do, so a car passing on the right was heard on the left
+    bool sound_x_left = false;
+    // a fixed-function stage with no texture reads (0,0,0,0) as its texture, as the hardware's stage with texture mode NONE
+    // does, not white: True Crime clears its shadow map's border with untextured lines that select the texture
+    bool unbound_texture_zero = false;
 };
 extern const GameInfo kGame;
 
