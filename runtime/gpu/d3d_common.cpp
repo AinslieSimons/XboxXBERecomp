@@ -653,8 +653,16 @@ void FillTexelConstants(int i, const TextureDesc& d, const StageReads& stages, D
     // a 3 console texel box per tap keeps the console chain's glow width and brightness
     if (stages.wide[i] > 0) {
         float n = std::ceil(kGlowBoxTexels * stages.wide[i] * 0.5f);
-        c.spread[i][0] = kGlowBoxTexels / (n * float(d.width) * k);
-        c.spread[i][1] = kGlowBoxTexels / (n * float(d.height) * k);
+        float across = kGlowBoxTexels / n;  // taps' spacing in units of 1 / (size x k)
+        // at most 5 taps a side, spread over the same width as the full count's: the count grows with the render scale, and at 14
+        // a side PGR2's replay blur (four stages a pixel) cost 28 ms. XBE_WIDE_TAPS=n another cap, 0 none
+        static const float cap = std::getenv("XBE_WIDE_TAPS") ? float(std::atoi(std::getenv("XBE_WIDE_TAPS"))) : 5.0f;
+        if (cap >= 2 && n > cap) {
+            across *= (n - 1) / (cap - 1);
+            n = cap;
+        }
+        c.spread[i][0] = across / (float(d.width) * k);
+        c.spread[i][1] = across / (float(d.height) * k);
         c.spread[i][2] = n;
     }
 }

@@ -1,8 +1,9 @@
 // The title's Direct3D 8 calls drawn with Metal, on macOS. The console path of d3d11.cpp, what does not depend on the
-// API shared through d3d_common, the generated HLSL translated by gpu/msl.cpp. Not here yet: MSAA, SMAA, a sampler's LOD
+// API shared through d3d_common, the generated HLSL translated by gpu/msl.cpp. Not here yet: SMAA, a sampler's LOD
 // bias, renderer extensions, F3 captures.
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#include <objc/runtime.h>
 #include <dispatch/dispatch.h>
 
 #include <algorithm>
@@ -30,6 +31,7 @@
 #include "core/log.h"
 #include "gpu/backend.h"
 #include "gpu/d3d_common.h"
+#include "app/perf.h"
 #include "gpu/msl.h"
 #include "gpu/shaders.h"
 #include "gpu/texture.h"
@@ -43,6 +45,130 @@ Mode DrawablePixels();  // the window's size in pixels
 }
 
 extern const char kShaderSourceHash[];  // written by CMake
+
+// ---- render passes encoded on worker threads
+// A recorder stands in for the render and blit encoders while a run of passes to the game's targets is made (XBE_PARALLEL_SMALL=1:
+// only the small square ones, the reflection cubes' faces): the drawing thread does all the work of a draw as ever, and the Metal calls it would have made go in a list. A worker
+// replays the list into a command buffer of its own, enqueued when the run began, so the GPU sees everything in order. The
+// workers touch nothing but Metal. Each run ends when anything else needs the GPU's order to be settled. XBE_NO_PARALLEL=1: off.
+namespace {
+struct RecOp {
+    enum Kind : uint8_t { BeginRender, EndRender, BeginBlit, EndBlit, BlitCall, Viewport, Scissor, Pipeline, Depth, StencilRef, Cull, Fill, Winding, DepthBias, Blend,
+                          VBytes, FBytes, VBuffer, FBuffer, FTexture, FSampler, Draw, DrawInst, DrawIndexed, VisMode, Accel } kind;
+    id a = nil, b = nil;
+    uint64_t n[6] = {};
+    double d[6] = {};
+};
+struct EncRun {
+    std::vector<RecOp> ops;
+    std::vector<uint8_t> bytes;
+    id<MTLCommandBuffer> cb;
+    id rec, blit;
+};
+}  // namespace
+
+@interface RecEnc : NSObject {
+@public
+    EncRun* run;
+}
+@end
+@implementation RecEnc
+- (RecOp&)op:(RecOp::Kind)k { run->ops.emplace_back(); RecOp& o = run->ops.back(); o.kind = k; return o; }
+- (void)endEncoding { [self op:RecOp::EndRender]; }
+- (void)setViewport:(MTLViewport)v { RecOp& o = [self op:RecOp::Viewport]; o.d[0] = v.originX, o.d[1] = v.originY, o.d[2] = v.width, o.d[3] = v.height, o.d[4] = v.znear, o.d[5] = v.zfar; }
+- (void)setScissorRect:(MTLScissorRect)r { RecOp& o = [self op:RecOp::Scissor]; o.n[0] = r.x, o.n[1] = r.y, o.n[2] = r.width, o.n[3] = r.height; }
+- (void)setRenderPipelineState:(id)p { [self op:RecOp::Pipeline].a = p; }
+- (void)setDepthStencilState:(id)p { [self op:RecOp::Depth].a = p; }
+- (void)setStencilReferenceValue:(uint32_t)v { [self op:RecOp::StencilRef].n[0] = v; }
+- (void)setCullMode:(MTLCullMode)v { [self op:RecOp::Cull].n[0] = uint64_t(v); }
+- (void)setTriangleFillMode:(MTLTriangleFillMode)v { [self op:RecOp::Fill].n[0] = uint64_t(v); }
+- (void)setFrontFacingWinding:(MTLWinding)v { [self op:RecOp::Winding].n[0] = uint64_t(v); }
+- (void)setDepthBias:(float)b slopeScale:(float)s clamp:(float)c { RecOp& o = [self op:RecOp::DepthBias]; o.d[0] = b, o.d[1] = s, o.d[2] = c; }
+- (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a { RecOp& o = [self op:RecOp::Blend]; o.d[0] = r, o.d[1] = g, o.d[2] = b, o.d[3] = a; }
+- (void)keepBytes:(const void*)p length:(NSUInteger)n index:(NSUInteger)i kind:(RecOp::Kind)k {
+    const size_t at = run->bytes.size();
+    run->bytes.resize(at + n);
+    std::memcpy(run->bytes.data() + at, p, n);
+    RecOp& o = [self op:k];
+    o.n[0] = at, o.n[1] = n, o.n[2] = i;
+}
+- (void)setVertexBytes:(const void*)p length:(NSUInteger)n atIndex:(NSUInteger)i { [self keepBytes:p length:n index:i kind:RecOp::VBytes]; }
+- (void)setFragmentBytes:(const void*)p length:(NSUInteger)n atIndex:(NSUInteger)i { [self keepBytes:p length:n index:i kind:RecOp::FBytes]; }
+- (void)setVertexBuffer:(id)b offset:(NSUInteger)f atIndex:(NSUInteger)i { RecOp& o = [self op:RecOp::VBuffer]; o.a = b, o.n[0] = f, o.n[1] = i; }
+- (void)setFragmentBuffer:(id)b offset:(NSUInteger)f atIndex:(NSUInteger)i { RecOp& o = [self op:RecOp::FBuffer]; o.a = b, o.n[0] = f, o.n[1] = i; }
+- (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i { RecOp& o = [self op:RecOp::FTexture]; o.a = t, o.n[0] = i; }
+- (void)setFragmentSamplerState:(id)t atIndex:(NSUInteger)i { RecOp& o = [self op:RecOp::FSampler]; o.a = t, o.n[0] = i; }
+- (void)setFragmentAccelerationStructure:(id)t atBufferIndex:(NSUInteger)i { RecOp& o = [self op:RecOp::Accel]; o.a = t, o.n[0] = i; }
+- (void)setVisibilityResultMode:(MTLVisibilityResultMode)m offset:(NSUInteger)f { RecOp& o = [self op:RecOp::VisMode]; o.n[0] = uint64_t(m), o.n[1] = f; }
+- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)c { RecOp& o = [self op:RecOp::Draw]; o.n[0] = uint64_t(t), o.n[1] = s, o.n[2] = c; }
+- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)c instanceCount:(NSUInteger)ic baseInstance:(NSUInteger)bi {
+    RecOp& o = [self op:RecOp::DrawInst]; o.n[0] = uint64_t(t), o.n[1] = s, o.n[2] = c, o.n[3] = ic, o.n[4] = bi;
+}
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)c indexType:(MTLIndexType)it indexBuffer:(id)b indexBufferOffset:(NSUInteger)f instanceCount:(NSUInteger)ic baseVertex:(NSInteger)bv baseInstance:(NSUInteger)bi {
+    RecOp& o = [self op:RecOp::DrawIndexed]; o.a = b, o.n[0] = uint64_t(t), o.n[1] = c, o.n[2] = uint64_t(it), o.n[3] = f, o.n[4] = ic, o.n[5] = uint64_t(bv); o.d[0] = double(bi);
+}
+@end
+
+// blits are few: whatever is called on it is kept as an invocation
+@interface RecBlit : NSObject {
+@public
+    EncRun* run;
+}
+@end
+@implementation RecBlit
+- (void)endEncoding { run->ops.emplace_back(); run->ops.back().kind = RecOp::EndBlit; }
+- (NSMethodSignature*)methodSignatureForSelector:(SEL)sel {
+    struct objc_method_description m = protocol_getMethodDescription(@protocol(MTLBlitCommandEncoder), sel, YES, YES);
+    return m.types ? [NSMethodSignature signatureWithObjCTypes:m.types] : [super methodSignatureForSelector:sel];
+}
+- (void)forwardInvocation:(NSInvocation*)inv {
+    [inv retainArguments];
+    run->ops.emplace_back();
+    RecOp& o = run->ops.back();
+    o.kind = RecOp::BlitCall;
+    o.a = inv;
+}
+@end
+
+namespace {
+void ReplayRun(EncRun& r) {
+    id<MTLRenderCommandEncoder> e = nil;
+    id<MTLBlitCommandEncoder> b = nil;
+    for (RecOp& o : r.ops) {
+        switch (o.kind) {
+            case RecOp::BeginRender: e = [r.cb renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor*)o.a]; break;
+            case RecOp::EndRender: [e endEncoding]; e = nil; break;
+            case RecOp::BeginBlit: b = [r.cb blitCommandEncoderWithDescriptor:(MTLBlitPassDescriptor*)o.a]; break;
+            case RecOp::EndBlit: [b endEncoding]; b = nil; break;
+            case RecOp::BlitCall: [(NSInvocation*)o.a invokeWithTarget:b]; break;
+            case RecOp::Viewport: [e setViewport:MTLViewport{o.d[0], o.d[1], o.d[2], o.d[3], o.d[4], o.d[5]}]; break;
+            case RecOp::Scissor: [e setScissorRect:MTLScissorRect{o.n[0], o.n[1], o.n[2], o.n[3]}]; break;
+            case RecOp::Pipeline: [e setRenderPipelineState:o.a]; break;
+            case RecOp::Depth: [e setDepthStencilState:o.a]; break;
+            case RecOp::StencilRef: [e setStencilReferenceValue:uint32_t(o.n[0])]; break;
+            case RecOp::Cull: [e setCullMode:MTLCullMode(o.n[0])]; break;
+            case RecOp::Fill: [e setTriangleFillMode:MTLTriangleFillMode(o.n[0])]; break;
+            case RecOp::Winding: [e setFrontFacingWinding:MTLWinding(o.n[0])]; break;
+            case RecOp::DepthBias: [e setDepthBias:float(o.d[0]) slopeScale:float(o.d[1]) clamp:float(o.d[2])]; break;
+            case RecOp::Blend: [e setBlendColorRed:float(o.d[0]) green:float(o.d[1]) blue:float(o.d[2]) alpha:float(o.d[3])]; break;
+            case RecOp::VBytes: [e setVertexBytes:r.bytes.data() + o.n[0] length:o.n[1] atIndex:o.n[2]]; break;
+            case RecOp::FBytes: [e setFragmentBytes:r.bytes.data() + o.n[0] length:o.n[1] atIndex:o.n[2]]; break;
+            case RecOp::VBuffer: [e setVertexBuffer:o.a offset:o.n[0] atIndex:o.n[1]]; break;
+            case RecOp::FBuffer: [e setFragmentBuffer:o.a offset:o.n[0] atIndex:o.n[1]]; break;
+            case RecOp::FTexture: [e setFragmentTexture:o.a atIndex:o.n[0]]; break;
+            case RecOp::FSampler: [e setFragmentSamplerState:o.a atIndex:o.n[0]]; break;
+            case RecOp::Accel: [e setFragmentAccelerationStructure:o.a atBufferIndex:o.n[0]]; break;
+            case RecOp::VisMode: [e setVisibilityResultMode:MTLVisibilityResultMode(o.n[0]) offset:o.n[1]]; break;
+            case RecOp::Draw: [e drawPrimitives:MTLPrimitiveType(o.n[0]) vertexStart:o.n[1] vertexCount:o.n[2]]; break;
+            case RecOp::DrawInst: [e drawPrimitives:MTLPrimitiveType(o.n[0]) vertexStart:o.n[1] vertexCount:o.n[2] instanceCount:o.n[3] baseInstance:o.n[4]]; break;
+            case RecOp::DrawIndexed:
+                [e drawIndexedPrimitives:MTLPrimitiveType(o.n[0]) indexCount:o.n[1] indexType:MTLIndexType(o.n[2]) indexBuffer:o.a indexBufferOffset:o.n[3] instanceCount:o.n[4] baseVertex:NSInteger(o.n[5]) baseInstance:NSUInteger(o.d[0])];
+                break;
+        }
+    }
+}
+}  // namespace
+
 
 namespace gpu {
 
@@ -102,6 +228,9 @@ constexpr uint32_t kVertexBufferBase = 1;  // buffer 0 holds the constants
 struct Target {
     id<MTLTexture> res;
     id<MTLTexture> fb;  // copy read by draws that sample the target they render to
+    // MSAA: a multisampled twin that draws go to. Each pass on it resolves into res as it ends, so res is always current for readers
+    id<MTLTexture> ms;
+    bool ms_stale = false;  // res was written without the twin: the twin takes res's pixels before its next draw
     bool depth = false;
     uint32_t gw = 0, gh = 0, w = 0, h = 0;
     uint32_t data = 0, bytes = 0;
@@ -339,12 +468,25 @@ public:
             // has no later flush to deliver it (PGR2 froze at a race's end, waiting on every light test in 0x187DC0). The
             // queue finishes in order, and a completed handler can still be to come after this wait, so the serial moves here.
             Commit();
-            if (!reports_.empty() && last_sent_) {
+            if (ReportsPending() && last_sent_) {
+                const auto wait_start = std::chrono::steady_clock::now();
                 [last_sent_ waitUntilCompleted];
+                perf::AddReportWait(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start).count());
                 const uint64_t serial = next_serial_ - 1;
                 uint64_t seen = completed_serial_.load();
                 while (seen < serial && !completed_serial_.compare_exchange_weak(seen, serial)) {}
             }
+            DeliverReports();
+        }
+    }
+    // a report asked for and the title not waiting: what is recorded goes to the GPU and this thread goes on. Each command
+    // buffer's completion delivers the reports it finishes (Commit), so a title polling without presenting still gets them.
+    // XBE_REPORTS_BLOCK=1: this thread waits for the GPU here, as Flush does
+    void Kick() override {
+        static const bool block = std::getenv("XBE_REPORTS_BLOCK") && *std::getenv("XBE_REPORTS_BLOCK") == '1';
+        if (block || g_reports_wait.load(std::memory_order_relaxed)) return Flush();
+        @autoreleasepool {
+            Commit();
             DeliverReports();
         }
     }
@@ -353,7 +495,14 @@ public:
         ramp_dirty_ = true;
     }
     void ClearReport() override { counted_.clear(); }
-    void GetReport(uint32_t report) override { reports_.push_back({report, counted_}); }
+    void GetReport(uint32_t report) override {
+        std::lock_guard lock(reports_lock_);
+        reports_.push_back({report, counted_});
+    }
+    bool ReportsPending() {
+        std::lock_guard lock(reports_lock_);
+        return !reports_.empty();
+    }
 
 private:
     struct Query {
@@ -401,8 +550,16 @@ private:
     id<MTLCommandBuffer> Cb();
     id<MTLCommandBuffer> Commit();  // what was recorded goes to the GPU; returns it
     void EndEncoder();
-    void OpenPass(id<MTLTexture> colour, id<MTLTexture> depth);
+    void OpenPass(id<MTLTexture> colour, id<MTLTexture> depth, id<MTLTexture> resolve_colour = nil, id<MTLTexture> resolve_depth = nil);
     id<MTLBlitCommandEncoder> Blitter();  // ends the render pass; end it after use
+    // the run of reflection passes being recorded for a worker, null none
+    std::shared_ptr<EncRun> run_;
+    bool draw_counting_ = false;  // the draw being made is under a visibility test: never in a run
+    bool RunWanted(id<MTLTexture> colour) const;
+    void StartRun();
+    void EndRun();
+    void BeginRender(MTLRenderPassDescriptor* d, id<MTLTexture> colour);
+    void ClearRender(MTLRenderPassDescriptor* d);
     Alloc Reserve(uint32_t bytes, uint32_t align = 16);
     // targets
     uint64_t SizedTargetKey(uint32_t data, bool depth, uint32_t gw, uint32_t gh) const;
@@ -410,6 +567,12 @@ private:
     Target* EnsureTarget(const Surface& s, bool depth, uint32_t gw = 0, uint32_t gh = 0);
     Target* DepthTarget(const State& s);
     bool CreateTarget(Target& t);
+    bool MsEligible(const Target& t) const;
+    bool EnsureMs(Target& t);
+    void RefreshMs(Target& t);
+    uint32_t msaa_ = 1;
+    bool bound_ms_ = false;  // the bound targets draw into their twins
+    float small_factor_ = 1.0f;  // g_small_target_factor as the targets were made with it
     bool TargetStale(uint32_t data) const;
     bool BindTargets(const State& s);
     void Unbind() { bound_rt_ = bound_ds_ = nullptr; }
@@ -428,7 +591,7 @@ private:
     void RecordShader(char kind, uint64_t key, const std::string& msl);
     void RecordPipeline(const PsoKey& k, const uint32_t strides[16]);
     MTLRenderPipelineDescriptor* PipelineDescriptor(const PsoKey& k, const uint32_t strides[16], id<MTLFunction> vs, id<MTLFunction> fs);
-    id<MTLRenderPipelineState> PassPipeline(const PassFn& f, MTLPixelFormat colour, MTLPixelFormat depth, bool over);
+    id<MTLRenderPipelineState> PassPipeline(const PassFn& f, MTLPixelFormat colour, MTLPixelFormat depth, bool over, NSUInteger samples);
     void SetPassTarget(id<MTLTexture> colour, id<MTLTexture> depth, uint32_t w, uint32_t h);
     void FullScreen(const PassFn& f, const float* cb, uint32_t cb_floats, id<MTLTexture> const* tex, uint32_t n_tex, bool over,
                     id<MTLDepthStencilState> depth, uint32_t stencil_ref = 0);
@@ -481,12 +644,41 @@ private:
     int frame_slot_ = 0;
     dispatch_semaphore_t frames_ = nullptr;
     std::atomic<uint64_t> completed_serial_{0};
+    // perf: each pass's GPU time, from timestamps at its stage boundaries; one buffer a frame in flight
+    static constexpr uint32_t kTimestampSamples = 4096;
+    id<MTLCounterSampleBuffer> ts_[kFramesInFlight] = {};
+    bool ts_tried_ = false;
+    uint32_t ts_used_ = 0;
+    // each encoder sampled (four samples each), for GPU time per pass and encoders.csv
+    enum EncoderKind : uint8_t { kEncDraw, kEncClear, kEncPresent, kEncBlit };
+    struct EncoderInfo {
+        EncoderKind kind = kEncDraw;
+        int pass = 0;
+        uint32_t w = 0, h = 0, format = 0, zw = 0, zh = 0;
+        uint8_t cload = 0, cstore = 0, zload = 0, zstore = 0;
+        uint32_t draws = 0, vertices = 0;
+        uint64_t vs = 0, ps = 0;
+        uint32_t tex_w = 0, tex_h = 0, tex_format = 0;
+        bool flat = false, blend = false;
+    };
+    std::vector<EncoderInfo> ts_pass_;
+    int ts_cur_ = -1;           // the open encoder's, -1 none
+    id<MTLTexture> enc_tex_[4] = {};        // what the open encoder has bound, to skip binds of the same thing
+    id<MTLSamplerState> enc_smp_[4] = {};
+    bool ts_probe_ = false;     // this frame: each screen-space draw an encoder of its own, to time it (1 frame in 120)
+    void SampleRender(MTLRenderPassDescriptor* d, EncoderKind kind);
+    MTLBlitPassDescriptor* SampleBlit();
+    MTLTimestamp ts_cpu_ = 0, ts_gpu_ = 0;
+    double ts_ns_per_tick_ = 1.0;
+    std::atomic<double> gpu_last_end_{0};  // the end of the last command buffer: frames in the queue overlap
+    bool EnsureTimestamps();
     uint64_t next_serial_ = 1;
     id<MTLBuffer> vis_;
     uint32_t vis_next_ = 0;
     // constants: the block in the ring holding what the last draw used
-    std::vector<uint8_t> const_last_;
     Alloc const_at_;
+    uint8_t const_last_[sizeof(State::vsc) + sizeof(DrawConstants)] = {};  // what const_at_ holds
+    bool const_whole_ = false;  // const_last_ has the fixed function constants
     bool const_bound_ = false;
     // set in the open encoder
     id<MTLRenderPipelineState> enc_pipeline_;
@@ -515,6 +707,7 @@ private:
     std::atomic<uint64_t> presents_seen_{0};  // presents_ for DeliverLate
     std::vector<Query> counted_;              // since the last ClearReport
     std::deque<Report> reports_;
+    std::mutex reports_lock_;                 // reports_: the drawing thread, and command buffers completing
     Assembled asm_;  // kept between draws for its buffers
     bool draw_2d_ = false;
     Target* bound_rt_ = nullptr;
@@ -640,7 +833,79 @@ bool MetalBackend::Init(uint32_t width, uint32_t height) {
 
 // ---- recording
 
+bool MetalBackend::RunWanted(id<MTLTexture> colour) const {
+    static const bool off = std::getenv("XBE_NO_PARALLEL") && *std::getenv("XBE_NO_PARALLEL") == '1';
+    static const bool small_only = std::getenv("XBE_PARALLEL_SMALL") && *std::getenv("XBE_PARALLEL_SMALL") == '1';  // the reflection cubes alone
+    return !off && colour && !draw_counting_ && (!small_only || (colour.width == colour.height && colour.width <= 1400));
+}
+
+void MetalBackend::StartRun() {
+    Commit();  // what came before goes first
+    run_ = std::make_shared<EncRun>();
+    run_->ops.reserve(1u << 16);  // a world pass is tens of thousands of calls: no regrowth on the drawing thread
+    run_->cb = [queue_ commandBuffer];
+    [run_->cb enqueue];  // its place in the GPU's order, whenever it is committed
+    RecEnc* rec = [RecEnc new];
+    rec->run = run_.get();
+    run_->rec = rec;
+    RecBlit* blit = [RecBlit new];
+    blit->run = run_.get();
+    run_->blit = blit;
+    perf::Add(perf::kNCommandBuffers);
+    const uint64_t frame = presents_;
+    auto* last_end = &gpu_last_end_;
+    [run_->cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        const double from = std::max(b.GPUStartTime, last_end->load()), to = b.GPUEndTime;
+        if (to > last_end->load()) last_end->store(to);
+        if (perf::On() && to > from) perf::Gpu(frame, (to - from) * 1000.0);
+    }];
+}
+
+void MetalBackend::EndRun() {
+    if (!run_) return;
+    if (enc_) EndEncoder();
+    std::shared_ptr<EncRun> r = std::move(run_);
+    run_ = nullptr;
+    last_sent_ = r->cb;
+    static dispatch_queue_t workers = dispatch_queue_create("reflection encoding", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INTERACTIVE, 0));
+    dispatch_async(workers, ^{
+        @autoreleasepool {
+            ReplayRun(*r);
+            [r->cb commit];
+        }
+    });
+}
+
+void MetalBackend::BeginRender(MTLRenderPassDescriptor* d, id<MTLTexture> colour) {
+    if (RunWanted(colour)) {
+        if (!run_) StartRun();
+        run_->ops.emplace_back();
+        run_->ops.back().kind = RecOp::BeginRender;
+        run_->ops.back().a = d;
+        enc_ = (id<MTLRenderCommandEncoder>)run_->rec;
+        return;
+    }
+    EndRun();
+    enc_ = [Cb() renderCommandEncoderWithDescriptor:d];
+}
+
+// a pass that only clears
+void MetalBackend::ClearRender(MTLRenderPassDescriptor* d) {
+    if (RunWanted(d.colorAttachments[0].texture) || (run_ && !d.colorAttachments[0].texture && d.depthAttachment.texture && d.depthAttachment.texture.width <= 1400)) {
+        if (!run_) StartRun();
+        run_->ops.emplace_back();
+        run_->ops.back().kind = RecOp::BeginRender;
+        run_->ops.back().a = d;
+        run_->ops.emplace_back();
+        run_->ops.back().kind = RecOp::EndRender;
+        return;
+    }
+    EndRun();
+    [[Cb() renderCommandEncoderWithDescriptor:d] endEncoding];
+}
+
 id<MTLCommandBuffer> MetalBackend::Cb() {
+    if (run_) EndRun();  // anything else's order is settled by the run going first
     if (!cb_) cb_ = [queue_ commandBuffer];
     return cb_;
 }
@@ -648,6 +913,9 @@ id<MTLCommandBuffer> MetalBackend::Cb() {
 void MetalBackend::EndEncoder() {
     if (!enc_) return;
     [enc_ endEncoding];
+    ts_cur_ = -1;
+    for (auto& t : enc_tex_) t = nil;
+    for (auto& t : enc_smp_) t = nil;
     enc_ = nil;
     enc_colour_ = enc_depth_ = nil;
     enc_pipeline_ = nil;
@@ -656,19 +924,31 @@ void MetalBackend::EndEncoder() {
 }
 
 id<MTLCommandBuffer> MetalBackend::Commit() {
+    EndRun();
     EndEncoder();
     id<MTLCommandBuffer> sent = cb_;
     if (!sent) return nil;
     uint64_t serial = next_serial_++;
+    perf::Add(perf::kNCommandBuffers);
     for (Query& q : counted_)
         if (!q.serial) q.serial = serial;
-    for (Report& r : reports_)
-        for (Query& q : r.queries)
-            if (!q.serial) q.serial = serial;
+    {
+        std::lock_guard lock(reports_lock_);
+        for (Report& r : reports_)
+            for (Query& q : r.queries)
+                if (!q.serial) q.serial = serial;
+    }
     auto* done = &completed_serial_;
-    [sent addCompletedHandler:^(id<MTLCommandBuffer>) {
+    const uint64_t frame = presents_;  // perf: the frame it was sent in, for its GPU time
+    auto* last_end = &gpu_last_end_;
+    [sent addCompletedHandler:^(id<MTLCommandBuffer> b) {
         uint64_t seen = done->load();
         while (seen < serial && !done->compare_exchange_weak(seen, serial)) {}
+        DeliverReports();
+        // busy time, not each buffer's span: buffers queued behind one another overlap in their start and end times
+        const double from = std::max(b.GPUStartTime, last_end->load()), to = b.GPUEndTime;
+        if (to > last_end->load()) last_end->store(to);
+        if (perf::On() && to > from) perf::Gpu(frame, (to - from) * 1000.0);
     }];
     [sent commit];
     cb_ = nil;
@@ -676,7 +956,21 @@ id<MTLCommandBuffer> MetalBackend::Commit() {
     return sent;
 }
 
-void MetalBackend::OpenPass(id<MTLTexture> colour, id<MTLTexture> depth) {
+// each pass on a twin ends by resolving into the target: the first sample for depth and stencil, as d3d11.cpp's resolve
+static void ResolveInto(MTLRenderPassColorAttachmentDescriptor* a, id<MTLTexture> to) {
+    a.resolveTexture = to;
+    a.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+}
+static void ResolveDepthInto(MTLRenderPassDescriptor* d, id<MTLTexture> to) {
+    d.depthAttachment.resolveTexture = to;
+    d.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterSample0;
+    d.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+    d.stencilAttachment.resolveTexture = to;
+    d.stencilAttachment.stencilResolveFilter = MTLMultisampleStencilResolveFilterSample0;
+    d.stencilAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+}
+
+void MetalBackend::OpenPass(id<MTLTexture> colour, id<MTLTexture> depth, id<MTLTexture> resolve_colour, id<MTLTexture> resolve_depth) {
     if (enc_ && enc_colour_ == colour && enc_depth_ == depth) return;
     EndEncoder();
     MTLRenderPassDescriptor* d = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -684,6 +978,7 @@ void MetalBackend::OpenPass(id<MTLTexture> colour, id<MTLTexture> depth) {
         d.colorAttachments[0].texture = colour;
         d.colorAttachments[0].loadAction = MTLLoadActionLoad;
         d.colorAttachments[0].storeAction = MTLStoreActionStore;
+        if (resolve_colour) ResolveInto(d.colorAttachments[0], resolve_colour);
     }
     if (depth) {
         d.depthAttachment.texture = depth;
@@ -692,16 +987,90 @@ void MetalBackend::OpenPass(id<MTLTexture> colour, id<MTLTexture> depth) {
         d.stencilAttachment.texture = depth;
         d.stencilAttachment.loadAction = MTLLoadActionLoad;
         d.stencilAttachment.storeAction = MTLStoreActionStore;
+        if (resolve_depth) ResolveDepthInto(d, resolve_depth);
     }
     d.visibilityResultBuffer = vis_;
-    enc_ = [Cb() renderCommandEncoderWithDescriptor:d];
+    perf::Add(perf::kNEncoders);
+    SampleRender(d, kEncDraw);
+    BeginRender(d, colour);
     enc_colour_ = colour;
     enc_depth_ = depth;
 }
 
+// perf: the encoder's vertex and fragment time, and what it draws to
+void MetalBackend::SampleRender(MTLRenderPassDescriptor* d, EncoderKind kind) {
+    if (!perf::On() || !EnsureTimestamps() || ts_used_ + 4 > kTimestampSamples) return;
+    MTLRenderPassSampleBufferAttachmentDescriptor* a = d.sampleBufferAttachments[0];
+    a.sampleBuffer = ts_[frame_slot_];
+    a.startOfVertexSampleIndex = ts_used_;
+    a.endOfVertexSampleIndex = ts_used_ + 1;
+    a.startOfFragmentSampleIndex = ts_used_ + 2;
+    a.endOfFragmentSampleIndex = ts_used_ + 3;
+    ts_used_ += 4;
+    EncoderInfo e;
+    e.kind = kind;
+    e.pass = perf::CurrentPass();
+    if (id<MTLTexture> c = d.colorAttachments[0].texture) e.w = uint32_t(c.width), e.h = uint32_t(c.height), e.format = uint32_t(c.pixelFormat);
+    if (id<MTLTexture> z = d.depthAttachment.texture) e.zw = uint32_t(z.width), e.zh = uint32_t(z.height);
+    e.cload = uint8_t(d.colorAttachments[0].loadAction), e.cstore = uint8_t(d.colorAttachments[0].storeAction);
+    e.zload = uint8_t(d.depthAttachment.loadAction), e.zstore = uint8_t(d.depthAttachment.storeAction);
+    ts_pass_.push_back(e);
+    ts_cur_ = kind == kEncDraw ? int(ts_pass_.size()) - 1 : -1;
+}
+
+// a blit encoder timed from start to end (the first two of its four samples)
+MTLBlitPassDescriptor* MetalBackend::SampleBlit() {
+    MTLBlitPassDescriptor* d = [MTLBlitPassDescriptor blitPassDescriptor];
+    if (!perf::On() || !EnsureTimestamps() || ts_used_ + 4 > kTimestampSamples) return d;
+    MTLBlitPassSampleBufferAttachmentDescriptor* a = d.sampleBufferAttachments[0];
+    a.sampleBuffer = ts_[frame_slot_];
+    a.startOfEncoderSampleIndex = ts_used_;
+    a.endOfEncoderSampleIndex = ts_used_ + 1;
+    ts_used_ += 4;
+    EncoderInfo e;
+    e.kind = kEncBlit;
+    e.pass = perf::CurrentPass();
+    ts_pass_.push_back(e);
+    return d;
+}
+
+bool MetalBackend::EnsureTimestamps() {
+    if (ts_tried_) return ts_[0] != nil;
+    ts_tried_ = true;
+    if (![dev_ supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        LOGR("perf: this GPU cannot time its stages: no GPU time per pass");
+        return false;
+    }
+    id<MTLCounterSet> set = nil;
+    for (id<MTLCounterSet> s in dev_.counterSets)
+        if ([s.name isEqualToString:MTLCommonCounterSetTimestamp]) set = s;
+    if (!set) return false;
+    MTLCounterSampleBufferDescriptor* d = [MTLCounterSampleBufferDescriptor new];
+    d.counterSet = set;
+    d.storageMode = MTLStorageModeShared;
+    d.sampleCount = kTimestampSamples;
+    for (auto& t : ts_) {
+        NSError* err = nil;
+        t = [dev_ newCounterSampleBufferWithDescriptor:d error:&err];
+        if (!t) {
+            LOGR("perf: no timestamp buffer: %s", err.localizedDescription.UTF8String);
+            ts_[0] = nil;
+            return false;
+        }
+    }
+    return true;
+}
+
 id<MTLBlitCommandEncoder> MetalBackend::Blitter() {
     EndEncoder();
-    return [Cb() blitCommandEncoder];
+    perf::Add(perf::kNBlits);
+    if (run_) {
+        run_->ops.emplace_back();
+        run_->ops.back().kind = RecOp::BeginBlit;
+        run_->ops.back().a = SampleBlit();
+        return (id<MTLBlitCommandEncoder>)run_->blit;
+    }
+    return [Cb() blitCommandEncoderWithDescriptor:SampleBlit()];
 }
 
 MetalBackend::Alloc MetalBackend::Reserve(uint32_t bytes, uint32_t align) {
@@ -735,9 +1104,51 @@ Target* MetalBackend::FindTarget(const Surface& s, bool depth) {
     return &it->second;
 }
 
+// the scene's targets, as big as the console's screen, and the depth drawn with them. Not the water's reflection (g_small_target)
+bool MetalBackend::MsEligible(const Target& t) const {
+    if (msaa_ <= 1 || (t.data && (t.data == g_small_target[0].load() || t.data == g_small_target[1].load()))) return false;
+    return t.depth || (t.gw == guest_w_ && t.gh == guest_h_);
+}
+
+bool MetalBackend::EnsureMs(Target& t) {
+    if (t.ms) return true;
+    if (![dev_ supportsTextureSampleCount:msaa_]) return false;
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:t.depth ? kDepth : kBgra width:t.w height:t.h mipmapped:NO];
+    td.textureType = MTLTextureType2DMultisample;
+    td.sampleCount = msaa_;
+    td.storageMode = MTLStorageModePrivate;
+    td.usage = MTLTextureUsageRenderTarget;
+    t.ms = [dev_ newTextureWithDescriptor:td];
+    if (!t.ms) {
+        LOG_FIRST(4, "metal: MSAA twin of %08X %ux%u could not be made", t.data, t.w, t.h);
+        return false;
+    }
+    t.ms_stale = true;
+    LOG_FIRST(8, "metal: MSAA %ux twin for %s %08X %ux%u", msaa_, t.depth ? "depth" : "target", t.data, t.w, t.h);
+    return true;
+}
+
+// res's pixels into the twin, after something other than the twin wrote them
+void MetalBackend::RefreshMs(Target& t) {
+    if (!t.ms || !t.ms_stale) return;
+    t.ms_stale = false;
+    if (!t.depth) {
+        SetPassTarget(t.ms, nil, t.w, t.h);
+        float uv[4] = {0, 0, 1, 1};
+        Blit(t.res, uv, {.alpha = true});
+        return;
+    }
+    PassFn f = PassFunctions(kDepthHlsl, "vs", "psmain");
+    if (!f.vs || !f.fs) return;
+    SetPassTarget(nil, t.ms, t.w, t.h);
+    id<MTLTexture> tex = t.res;
+    FullScreen(f, nullptr, 0, &tex, 1, false, depth_always_);
+}
+
 bool MetalBackend::CreateTarget(Target& t) {
-    t.w = std::max(1u, uint32_t(std::lround(t.gw * scale_ * XStretch(aspect_, guest_h_, t.gw, t.gh))));
-    t.h = std::max(1u, uint32_t(std::lround(t.gh * scale_)));
+    const float small = t.data && (t.data == g_small_target[0].load() || t.data == g_small_target[1].load()) ? small_factor_ : 1.0f;
+    t.w = std::max(1u, uint32_t(std::lround(t.gw * scale_ * small * XStretch(aspect_, guest_h_, t.gw, t.gh))));
+    t.h = std::max(1u, uint32_t(std::lround(t.gh * scale_ * small)));
     MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:t.depth ? kDepth : kBgra width:t.w height:t.h mipmapped:NO];
     td.storageMode = MTLStorageModePrivate;
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
@@ -760,7 +1171,8 @@ bool MetalBackend::CreateTarget(Target& t) {
         d.colorAttachments[0].storeAction = MTLStoreActionStore;
         d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
     }
-    [[Cb() renderCommandEncoderWithDescriptor:d] endEncoding];
+    SampleRender(d, kEncClear);
+    ClearRender(d);
     return true;
 }
 
@@ -782,6 +1194,7 @@ Target* MetalBackend::EnsureTarget(const Surface& s, bool depth, uint32_t gw, ui
     t.depth = depth;
     t.gw = sw;
     t.gh = sh;
+    t.data = data;  // CreateTarget's size may depend on it
     if (!CreateTarget(t)) {
         LOG_FIRST(8, "metal: target %08X %ux%u could not be made", data, sw, sh);
         return nullptr;
@@ -829,10 +1242,16 @@ bool MetalBackend::BindTargets(const State& s) {
                  (unsigned long long)presents_);
         UploadTarget(*rt, s.rt);
     }
-    if (rt) rt->drawn = true;
-    if (ds) ds->drawn = true;
+    const bool ms = rt && MsEligible(*rt) && EnsureMs(*rt) && (!ds || EnsureMs(*ds));
+    for (Target* t : {rt, ds}) {
+        if (!t) continue;
+        if (ms) RefreshMs(*t);
+        else if (t->ms) t->ms_stale = true;
+        t->drawn = true;
+    }
     bound_rt_ = rt;
     bound_ds_ = ds;
+    bound_ms_ = ms;
     return true;
 }
 
@@ -855,6 +1274,7 @@ void MetalBackend::UploadTarget(Target& t, const Surface& s) {
     id<MTLTexture> tex = [dev_ newTextureWithDescriptor:td];
     if (!tex) return;
     [tex replaceRegion:MTLRegionMake2D(0, 0, d.width, d.height) mipmapLevel:0 withBytes:px.data() bytesPerRow:pitch];
+    if (t.ms) t.ms_stale = true;
     SetPassTarget(t.res, nil, t.w, t.h);
     float uv[4] = {0, 0, 1, 1};
     Blit(tex, uv, {.alpha = true, .over = over});
@@ -882,6 +1302,7 @@ id<MTLTexture> MetalBackend::PrepareCopySource(Target& t) {
 // a BGRA texture to the CPU, rows packed; waits for the GPU
 bool MetalBackend::ReadBack(id<MTLTexture> src, uint32_t w, uint32_t h, std::vector<uint8_t>& out) {
     const auto start = std::chrono::steady_clock::now();
+    EndRun();  // the copy below is waited for: it goes in a command buffer of this thread's
     id<MTLBuffer> st = [dev_ newBufferWithLength:size_t(w) * h * 4 options:MTLResourceStorageModeShared];
     if (!st) return false;
     id<MTLBlitCommandEncoder> b = Blitter();
@@ -1203,17 +1624,18 @@ void MetalBackend::RecordPipeline(const PsoKey& k, const uint32_t strides[16]) {
     std::fflush(cache_.records);
 }
 
-id<MTLRenderPipelineState> MetalBackend::PassPipeline(const PassFn& f, MTLPixelFormat colour, MTLPixelFormat depth, bool over) {
+id<MTLRenderPipelineState> MetalBackend::PassPipeline(const PassFn& f, MTLPixelFormat colour, MTLPixelFormat depth, bool over, NSUInteger samples) {
     if (!f.vs || !f.fs) return nil;
     uint64_t key = uint64_t((__bridge void*)f.vs) * 31 + uint64_t((__bridge void*)f.fs);
     (void)key;
     std::string name = std::string(f.vs.name.UTF8String) + "/" + f.fs.name.UTF8String;
-    key = Hash(name.data(), name.size(), uint64_t(colour) * 1000 + uint64_t(depth) * 3 + (over ? 1 : 0));
+    key = Hash(name.data(), name.size(), uint64_t(colour) * 1000 + uint64_t(depth) * 3 + (over ? 1 : 0) + uint64_t(samples) * 1000000);
     auto it = pass_pipelines_.find(key);
     if (it != pass_pipelines_.end()) return it->second;
     MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = f.vs;
     d.fragmentFunction = f.fs;
+    d.rasterSampleCount = samples;
     d.colorAttachments[0].pixelFormat = colour;
     if (over) {
         auto* c = d.colorAttachments[0];
@@ -1247,7 +1669,8 @@ void MetalBackend::FullScreen(const PassFn& f, const float* cb, uint32_t cb_floa
                               id<MTLDepthStencilState> depth, uint32_t stencil_ref) {
     MTLPixelFormat cf = enc_colour_ ? enc_colour_.pixelFormat : MTLPixelFormatInvalid;
     MTLPixelFormat df = enc_depth_ ? enc_depth_.pixelFormat : MTLPixelFormatInvalid;
-    id<MTLRenderPipelineState> state = PassPipeline(f, cf, df, over);
+    const NSUInteger samples = enc_colour_ ? enc_colour_.sampleCount : enc_depth_ ? enc_depth_.sampleCount : 1;
+    id<MTLRenderPipelineState> state = PassPipeline(f, cf, df, over, samples);
     if (!state) return;
     [enc_ setRenderPipelineState:state];
     enc_pipeline_ = state;
@@ -1264,6 +1687,7 @@ void MetalBackend::FullScreen(const PassFn& f, const float* cb, uint32_t cb_floa
     }
     for (int i = 0; i < 4; i++) [enc_ setFragmentSamplerState:pass_samplers_[i] atIndex:i];
     for (uint32_t i = 0; i < n_tex; i++) [enc_ setFragmentTexture:tex[i] atIndex:i];
+    for (uint32_t i = 0; i < 4; i++) enc_tex_[i] = nil, enc_smp_[i] = nil;  // the pass's own, not the draws'
     [enc_ drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 }
 
@@ -1291,6 +1715,7 @@ bool MetalBackend::DepthCopy(const State& s) {
     Target& src = si->second;
     PassFn f = PassFunctions(kDepthHlsl, "vs", "psmain");
     if (!f.vs || !f.fs) return false;
+    if (dst.ms) dst.ms_stale = true;
     SetPassTarget(nil, dst.res, dst.w, dst.h);
     id<MTLTexture> tex = src.res;
     FullScreen(f, nullptr, 0, &tex, 1, false, depth_always_);
@@ -1303,22 +1728,27 @@ bool MetalBackend::DepthCopy(const State& s) {
 void MetalBackend::ClearWhole(Target& t, uint32_t flags, const float colour[4], float z, uint32_t stencil) {
     EndEncoder();
     MTLRenderPassDescriptor* d = [MTLRenderPassDescriptor renderPassDescriptor];
+    id<MTLTexture> into = t.ms ? t.ms : t.res;  // a twin is cleared and resolved
+    if (t.ms && (!t.depth || ((flags & kClearZ) && (flags & kClearStencil)))) t.ms_stale = false;
     if (t.depth) {
-        d.depthAttachment.texture = t.res;
+        d.depthAttachment.texture = into;
         d.depthAttachment.loadAction = (flags & kClearZ) ? MTLLoadActionClear : MTLLoadActionLoad;
         d.depthAttachment.storeAction = MTLStoreActionStore;
         d.depthAttachment.clearDepth = std::clamp(z, 0.0f, 1.0f);
-        d.stencilAttachment.texture = t.res;
+        d.stencilAttachment.texture = into;
         d.stencilAttachment.loadAction = (flags & kClearStencil) ? MTLLoadActionClear : MTLLoadActionLoad;
         d.stencilAttachment.storeAction = MTLStoreActionStore;
         d.stencilAttachment.clearStencil = stencil & 0xFF;
+        if (t.ms) ResolveDepthInto(d, t.res);
     } else {
-        d.colorAttachments[0].texture = t.res;
+        d.colorAttachments[0].texture = into;
         d.colorAttachments[0].loadAction = MTLLoadActionClear;
         d.colorAttachments[0].storeAction = MTLStoreActionStore;
         d.colorAttachments[0].clearColor = MTLClearColorMake(colour[0], colour[1], colour[2], colour[3]);
+        if (t.ms) ResolveInto(d.colorAttachments[0], t.res);
     }
-    [[Cb() renderCommandEncoderWithDescriptor:d] endEncoding];
+    SampleRender(d, kEncClear);
+    ClearRender(d);
 }
 
 // a clear of part of a target: the full screen triangle in each rect
@@ -1337,6 +1767,7 @@ void MetalBackend::ClearRects(Target& t, const std::vector<RECT>& rs, uint32_t f
         }
         dss = [dev_ newDepthStencilStateWithDescriptor:dd];
     }
+    if (t.ms) t.ms_stale = true;
     SetPassTarget(t.depth ? nil : t.res, t.depth ? t.res : nil, t.w, t.h);
     float cb[8] = {colour[0], colour[1], colour[2], colour[3], z, 0, 0, 0};
     for (const RECT& r : rs) {
@@ -1381,6 +1812,7 @@ void MetalBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
 
 // one Blit per rect: the targets' scales differ
 void MetalBackend::CopyByDraw(Target& src_t, Target& dst_t, uint32_t count, uint32_t src_rects, uint32_t dst_points) {
+    if (dst_t.ms) dst_t.ms_stale = true;
     SetPassTarget(dst_t.res, nil, dst_t.w, dst_t.h);
     float src_scale = float(src_t.w) / src_t.gw;
     float dst_scale = float(dst_t.w) / dst_t.gw;
@@ -1434,6 +1866,7 @@ void MetalBackend::CopyByRegion(Target& src_t, Target& dst_t, uint32_t count, ui
         if (right <= left || bottom <= top || dx >= dst_t.w || dy >= dst_t.h) continue;
         right = std::min(right, left + dst_t.w - dx);
         bottom = std::min(bottom, top + dst_t.h - dy);
+        if (dst_t.ms) dst_t.ms_stale = true;
         [blit copyFromTexture:src_t.res sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(left, top, 0)
                    sourceSize:MTLSizeMake(right - left, bottom - top, 1) toTexture:dst_t.res destinationSlice:0
              destinationLevel:0 destinationOrigin:MTLOriginMake(dx, dy, 0)];
@@ -1983,6 +2416,7 @@ MTLRenderPipelineDescriptor* MetalBackend::PipelineDescriptor(const PsoKey& k, c
     MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = vs;
     d.fragmentFunction = fs;
+    d.rasterSampleCount = std::max<uint32_t>(k.samples, 1);
     if (cache_.archive) d.binaryArchives = @[cache_.archive];
     MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
     uint32_t used = 0;
@@ -2120,17 +2554,30 @@ void MetalBackend::UploadConstants(const State& s, const DrawShaders& sh, const 
         FillTransformConstants(s, size, c);
         FillLightConstants(s, sh.fk, c);
     }
-    // VC then DC, one block: a new one only when something in it changed
-    const size_t total = sizeof(s.vsc) + sizeof(c);
+    // VC then DC, one block in the ring: a new one only when something read from it changed. Only fixed function vertex shaders read
+    // wv to lt, so other draws neither compare nor write them (their bytes are stale). The comparing is against a copy in cached
+    // memory: the ring is write-combined, and reading it costs more than the copy saves
+    constexpr size_t kVc = sizeof(s.vsc), kDc = sizeof(c), kHole = offsetof(DrawConstants, wv), kHoleEnd = offsetof(DrawConstants, wdepth);
     const uint8_t* vsc = reinterpret_cast<const uint8_t*>(s.vsc.data());
-    bool same = const_last_.size() == total && !std::memcmp(const_last_.data(), vsc, sizeof(s.vsc)) &&
-                !std::memcmp(const_last_.data() + sizeof(s.vsc), &c, sizeof(c)) && const_at_.buf == ring_;
-    if (!same) {
-        const_last_.resize(total);
-        std::memcpy(const_last_.data(), vsc, sizeof(s.vsc));
-        std::memcpy(const_last_.data() + sizeof(s.vsc), &c, sizeof(c));
-        const_at_ = Reserve(uint32_t(total), 256);
-        std::memcpy(const_at_.p, const_last_.data(), total);
+    const uint8_t* dc = reinterpret_cast<const uint8_t*>(&c);
+    uint8_t* last_dc = const_last_ + kVc;
+    const bool whole = sh.fixed_transform;
+    const size_t head = whole ? kDc : kHole, tail = whole ? 0 : kDc - kHoleEnd;
+    const bool vc_same = !std::memcmp(const_last_, vsc, kVc);
+    const bool dc_same = const_whole_ == whole && !std::memcmp(last_dc, dc, head) && !std::memcmp(last_dc + kHoleEnd, dc + kHoleEnd, tail);
+    if (!(vc_same && dc_same && const_at_.p && const_at_.buf == ring_)) {
+        if (!vc_same) std::memcpy(const_last_, vsc, kVc);
+        if (!dc_same) {
+            std::memcpy(last_dc, dc, head);
+            std::memcpy(last_dc + kHoleEnd, dc + kHoleEnd, tail);
+            const_whole_ = whole;
+        }
+        const_at_ = Reserve(uint32_t(kVc + kDc), 256);
+        std::memcpy(const_at_.p, vsc, kVc);
+        std::memcpy(const_at_.p + kVc, dc, head);
+        std::memcpy(const_at_.p + kVc + kHoleEnd, dc + kHoleEnd, tail);
+        perf::Add(perf::kNConstantUploads);
+        perf::Add(perf::kNConstantBytes, kVc + head + tail);
         const_bound_ = false;
     }
     if (!const_bound_) {
@@ -2146,6 +2593,7 @@ void MetalBackend::DrawGeometry(const Assembled& a, const Pipeline& p) {
         if (!b.bytes) continue;
         Alloc at = Reserve(b.bytes, 16);
         std::memcpy(at.p, b.src, b.bytes);
+        perf::Add(perf::kNVertexBytes, b.bytes);
         [enc_ setVertexBuffer:at.buf offset:at.offset atIndex:kVertexBufferBase + i];
     }
     if (p.points) {
@@ -2172,6 +2620,7 @@ void MetalBackend::DrawGeometry(const Assembled& a, const Pipeline& p) {
         uint32_t ibytes = a.index_count * (a.index16 ? 2 : 4);
         Alloc at = Reserve(ibytes, 16);
         std::memcpy(at.p, a.index_src, ibytes);
+        perf::Add(perf::kNIndexBytes, ibytes);
         [enc_ drawIndexedPrimitives:type indexCount:a.index_count indexType:a.index16 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
                         indexBuffer:at.buf indexBufferOffset:at.offset instanceCount:1 baseVertex:a.base_vertex baseInstance:0];
     } else {
@@ -2181,6 +2630,14 @@ void MetalBackend::DrawGeometry(const Assembled& a, const Pipeline& p) {
 
 void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     if (const State* sprites = PointSpriteStages(s, prim)) return Draw(*sprites, prim, start, count, indices);
+    // perf: the CPU time of a draw, the outermost call only (one drawn again with another stage 3 is inside it)
+    struct Timed {
+        bool on;
+        std::chrono::steady_clock::time_point start;
+        ~Timed() {
+            if (on) perf::AddDrawCpu(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        }
+    } timed{perf::On() && !g_draw_filtered, perf::On() && !g_draw_filtered ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
     @autoreleasepool {
         if (s.blank_format && s.textures[0] && (::kernel::R32(s.textures[0] + 12) >> 8 & 0xFF) == s.blank_format) {
             Clear(s, 0, nullptr, kClearTarget, 0xFF000000u, 0, 0);  // a black clear in its place (State::blank_format)
@@ -2200,6 +2657,7 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         }
         if (g_draw_filter && !g_draw_filtered) g_draw_filter(s, adjust);
         if (adjust.skip) return;
+        if (!g_draw_filtered) perf::CountDraw(prim, count);
         if (adjust.trace_scene) AddToScene(s, prim, start, count, indices, adjust);
         if (adjust.stage3) {
             g_draw_filtered = true;
@@ -2209,9 +2667,12 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             g_draw_filtered = false;
             return;
         }
+        perf::Lap lap;
         Assembled& a = asm_;
         if (!Assemble(s, prim, start, count, indices, a)) return;
+        lap.Mark(perf::kStAssemble);
         if (!BindTargets(s)) return;
+        lap.Mark(perf::kStTargets);
 
         DrawShaders sh = ClassifyShaders(s, a, count);
         if (sh.prog) EnsureProgramHash(s);
@@ -2222,8 +2683,11 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         draw_rt_ = bound_rt_;
         draw_ds_ = bound_ds_;
         draw_2d_ = a.pretransformed || ScreenDraw(s);
+        lap.Mark(perf::kStShaders);
         for (int i = 0; i < 4; i++) stages.tex[i] = BindTexture(s, i, stages);
+        lap.Mark(perf::kStTextures);
         if (!BindTargets(s)) return;
+        lap.Mark(perf::kStTargets);
         PixelKey pk = MakePixelKey(s, stages.info);
         pk.quad = sh.quad;
         const bool traced = adjust.trace_reflect && trace_live_ >= 0 && pk.programmable && pk.tex[3].kind == kTexCube && !pk.tex[3].shadow;
@@ -2240,13 +2704,15 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             return !(e && *e == '0');
         }();
         pk.wbuf = wbuffer && s.rs[kRsZEnable] == 2 && bound_ds_ ? 1 : 0;
+        // alpha tested, not blended, onto twins: Settings::alpha_coverage (not quads, whose shader is rewritten)
+        if (app::Get().alpha_coverage && bound_ms_ && !sh.quad && SimpleState(s, kMAlphaTestEnable) && !SimpleState(s, kMBlendEnable)) pk.coverage = msaa_;
         sh.pkey = Hash(&pk, sizeof(pk));
         EnsurePixelShader(pk, sh);
         if (!sh.vs_code || !sh.ps_code) return;
 
         PsoKey k;
         PipelineTargets pt{.rt = bound_rt_ != nullptr, .rtfmt = bound_rt_ ? uint32_t(DXGI_FORMAT_B8G8R8A8_UNORM) : 0u, .ds = bound_ds_ != nullptr,
-                           .ds_scale = bound_ds_ ? float(bound_ds_->h) / bound_ds_->gh : 1.0f, .samples = 1};
+                           .ds_scale = bound_ds_ ? float(bound_ds_->h) / bound_ds_->gh : 1.0f, .samples = bound_ms_ ? msaa_ : 1};
         BuildPipelineKey(s, a, sh.vh, sh.ph, pt, k);
         if (!adjust.depth_test) k.zen = k.zwrite = 0;
         k.zbias += adjust.depth_bias;
@@ -2256,8 +2722,28 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         Pipeline* p = EnsurePipeline(k, a, sh);
         if (!p->state) return;
 
-        OpenPass(bound_rt_ ? bound_rt_->res : nil, bound_ds_ ? bound_ds_->res : nil);
-        if (enc_pipeline_ != p->state) [enc_ setRenderPipelineState:(enc_pipeline_ = p->state)];
+        lap.Mark(perf::kStPipeline);
+        draw_counting_ = s.simple[kMCountEnable >> 2] != 0;
+        if (draw_counting_ && run_) EndRun();
+        if (ts_probe_ && perf::On() && enc_ && draw_2d_) EndEncoder();  // this draw alone in its encoder
+        if (bound_ms_)
+            OpenPass(bound_rt_ ? bound_rt_->ms : nil, bound_ds_ ? bound_ds_->ms : nil, bound_rt_ ? bound_rt_->res : nil, bound_ds_ ? bound_ds_->res : nil);
+        else
+            OpenPass(bound_rt_ ? bound_rt_->res : nil, bound_ds_ ? bound_ds_->res : nil);
+        lap.Mark(perf::kStOpenPass);
+        if (ts_cur_ >= 0) {
+            EncoderInfo& e = ts_pass_[size_t(ts_cur_)];
+            if (!e.draws) {
+                e.vs = sh.vkey, e.ps = sh.pkey, e.flat = draw_2d_, e.blend = s.simple[kMBlendEnable >> 2] != 0;
+                if (stages.tex[0]) e.tex_w = uint32_t(stages.tex[0].width), e.tex_h = uint32_t(stages.tex[0].height), e.tex_format = uint32_t(stages.tex[0].pixelFormat);
+            }
+            e.draws++;
+            e.vertices += count;
+        }
+        if (enc_pipeline_ != p->state) {
+            [enc_ setRenderPipelineState:(enc_pipeline_ = p->state)];
+            perf::Add(perf::kNPipelineBinds);
+        }
         id<MTLDepthStencilState> depth_state = DepthState(k);
         if (enc_depth_state_ != depth_state) [enc_ setDepthStencilState:(enc_depth_state_ = depth_state)];
         [enc_ setStencilReferenceValue:SimpleState(s, kMStencilRef) & 0xFF];
@@ -2304,7 +2790,9 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             const auto& object = trace_[trace_live_].object;
             c.trace[7][1] = adjust.trace_self && adjust.trace_self <= object.size() ? float(object[adjust.trace_self - 1]) : 0.0f;
         }
+        lap.Mark(perf::kStEncoderState);
         UploadConstants(s, sh, k, stages, size, c);
+        lap.Mark(perf::kStConstants);
         if (traced) {
             [enc_ setFragmentAccelerationStructure:trace_[trace_live_].as atBufferIndex:1];
             [enc_ setFragmentBuffer:trace_[trace_live_].colours offset:0 atIndex:2];
@@ -2319,8 +2807,17 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             id<MTLTexture> t = stages.tex[i];
             // a shadow stage reads a depth format, whatever is bound
             if (!t || (stages.info[i].shadow && t.pixelFormat != kDepth)) t = Dummy(stages.info[i]);
-            [enc_ setFragmentTexture:t atIndex:i];
-            [enc_ setFragmentSamplerState:Sampler(StageSampler(s, i, stages.levels[i], stages.info[i].shadow, clamp, aniso, stages.replaced[i])) atIndex:i];
+            static const bool no_skip = std::getenv("XBE_NO_BINDSKIP") && *std::getenv("XBE_NO_BINDSKIP") == '1';  // testing: every bind made
+            if (no_skip || enc_tex_[i] != t) {
+                [enc_ setFragmentTexture:t atIndex:i];
+                enc_tex_[i] = t;
+                perf::Add(perf::kNTextureBinds);
+            }
+            id<MTLSamplerState> sampler = Sampler(StageSampler(s, i, stages.levels[i], stages.info[i].shadow, clamp, aniso, stages.replaced[i]));
+            if (no_skip || enc_smp_[i] != sampler) {
+                [enc_ setFragmentSamplerState:sampler atIndex:i];
+                enc_smp_[i] = sampler;
+            }
         }
 
         // the viewport covers the target, the guest viewport is in the shader; the scissor clips to it
@@ -2364,7 +2861,9 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             [enc_ setVisibilityResultMode:MTLVisibilityResultModeCounting offset:slot * 8];
             counted_.push_back({slot, 0, SamplesPerPixel()});
         }
+        lap.Mark(perf::kStTextureSet);
         DrawGeometry(a, *p);
+        lap.Mark(perf::kStGeometry);
         if (counting) [enc_ setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
     }
 }
@@ -2374,12 +2873,13 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 float MetalBackend::SamplesPerPixel() const {
     const Target* t = bound_rt_ ? bound_rt_ : bound_ds_;
     if (!t || !t->gw || !t->gh) return 1;
-    return float(t->w) * float(t->h) / (float(t->gw) * float(t->gh));
+    return float(t->w) * float(t->h) / (float(t->gw) * float(t->gh)) * float(bound_ms_ ? msaa_ : 1);
 }
 
 // reports whose draws the GPU has finished, written as the console's GPU writes them: time, count, then 0 for done
 void MetalBackend::DeliverReports() {
     constexpr uint32_t kTime = 0, kTimeHigh = 4, kCount = 8, kStatus = 12;
+    std::lock_guard lock(reports_lock_);
     const uint64_t done = completed_serial_.load();
     while (!reports_.empty()) {
         Report& r = reports_.front();
@@ -2480,6 +2980,7 @@ void MetalBackend::Present(const Surface& front) {
             d.colorAttachments[0].loadAction = MTLLoadActionClear;
             d.colorAttachments[0].storeAction = MTLStoreActionStore;
             d.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+            SampleRender(d, kEncPresent);
             enc_ = [Cb() renderCommandEncoderWithDescriptor:d];
             enc_colour_ = drawable.texture;
             enc_depth_ = nil;
@@ -2512,19 +3013,77 @@ void MetalBackend::Present(const Surface& front) {
             }
             [Cb() presentDrawable:drawable];
         }
+        // perf: the frame's pass times, read when its last command buffer is done (before its timestamp buffer can be reused)
+        if (ts_used_) {
+            if (presents_ % 60 == 0) {
+                MTLTimestamp cpu = 0, gpu = 0;
+                [dev_ sampleTimestamps:&cpu gpuTimestamp:&gpu];
+                if (ts_gpu_ && gpu > ts_gpu_ && cpu > ts_cpu_) ts_ns_per_tick_ = double(cpu - ts_cpu_) / double(gpu - ts_gpu_);
+                ts_cpu_ = cpu, ts_gpu_ = gpu;
+            }
+            id<MTLCounterSampleBuffer> buffer = ts_[frame_slot_];
+            const uint32_t used = ts_used_;
+            auto passes = std::make_shared<std::vector<EncoderInfo>>(std::move(ts_pass_));
+            const uint64_t frame_number = presents_;
+            const double ms_per_tick = ts_ns_per_tick_ / 1e6;
+            const bool write_rows = presents_ % 10 == 0, probe = ts_probe_;
+            [Cb() addCompletedHandler:^(id<MTLCommandBuffer>) {
+                NSData* data = [buffer resolveCounterRange:NSMakeRange(0, used)];
+                if (!data || data.length < used * sizeof(MTLCounterResultTimestamp)) return;
+                auto* t = static_cast<const MTLCounterResultTimestamp*>(data.bytes);
+                auto span = [&](uint32_t a, uint32_t b) {
+                    return t[a].timestamp != MTLCounterErrorValue && t[b].timestamp != MTLCounterErrorValue && t[b].timestamp > t[a].timestamp
+                               ? double(t[b].timestamp - t[a].timestamp) * ms_per_tick : 0.0;
+                };
+                std::string rows;
+                for (uint32_t i = 0; i < passes->size(); i++) {
+                    const EncoderInfo& e = (*passes)[i];
+                    const double vertex = span(i * 4, i * 4 + 1), fragment = e.kind == kEncBlit ? 0.0 : span(i * 4 + 2, i * 4 + 3);
+                    if (e.kind == kEncDraw) perf::GpuPass(frame_number, e.pass, vertex, fragment);
+                    else perf::GpuOther(frame_number, e.kind == kEncClear ? perf::kGpuClear : e.kind == kEncPresent ? perf::kGpuPresent : perf::kGpuBlit, vertex + fragment);
+                    if (write_rows) {
+                        char line[320];
+                        std::snprintf(line, sizeof line, "%llu,%d,%u,%d,%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%llx,%llx,%u,%u,%u,%d,%d,%.3f,%.3f\n", (unsigned long long)frame_number, probe ? 1 : 0, i, int(e.kind), e.pass,
+                                      e.w, e.h, e.format, e.zw, e.zh, e.cload, e.cstore, e.zload, e.zstore, e.draws, e.vertices, (unsigned long long)e.vs, (unsigned long long)e.ps, e.tex_w, e.tex_h, e.tex_format, e.flat ? 1 : 0, e.blend ? 1 : 0, vertex, fragment);
+                        rows += line;
+                    }
+                }
+                if (write_rows) perf::EncoderRows(rows);
+            }];
+            ts_used_ = 0;
+            ts_pass_.clear();
+        }
         // the frame's ring stays untouched until the GPU is done with it
         dispatch_semaphore_t frames = frames_;
         [Cb() addCompletedHandler:^(id<MTLCommandBuffer>) { dispatch_semaphore_signal(frames); }];
         Commit();
         Unbind();
+        const auto inflight_start = std::chrono::steady_clock::now();
         dispatch_semaphore_wait(frames_, DISPATCH_TIME_FOREVER);
+        const double inflight_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - inflight_start).count();
         frame_slot_ = (frame_slot_ + 1) % kFramesInFlight;
         ring_ = rings_[frame_slot_];
+        const uint32_t ring_kb = ring_used_ / 1024;  // perf: what the finished frame used
         ring_used_ = 0;
-        const_last_.clear();
+        const_at_ = {};
         BuildScene();
         DeliverReports();
+        static double gpu_mem_mb = 0;
+        static uint32_t thermal = 0;
+        if (perf::On() && presents_ % 30 == 0) {
+            gpu_mem_mb = double(dev_.currentAllocatedSize) / 1048576.0;
+            thermal = uint32_t(NSProcessInfo.processInfo.thermalState);
+        }
+        perf::Frame(presents_, {.shaders_ms = cost_.shaders_ms, .pipelines_ms = cost_.pipelines_ms, .uploads_ms = cost_.uploads_ms,
+                                .readback_ms = cost_.readback_ms, .drawable_ms = cost_.drawable_ms, .inflight_ms = inflight_ms,
+                                .title_wait_ms = {double(g_perf_wait_kind_ns[0].exchange(0)) / 1e6, double(g_perf_wait_kind_ns[1].exchange(0)) / 1e6,
+                                                  double(g_perf_wait_kind_ns[2].exchange(0)) / 1e6, double(g_perf_wait_kind_ns[3].exchange(0)) / 1e6,
+                                                  double(g_perf_wait_kind_ns[4].exchange(0)) / 1e6, double(g_perf_wait_kind_ns[5].exchange(0)) / 1e6},
+                                .shaders = cost_.shaders, .pipelines = cost_.pipelines, .uploads = cost_.uploads, .readbacks = cost_.readbacks,
+                                .game_capture_ms = double(g_perf_capture_ns.exchange(0)) / 1e6, .gpu_mem_mb = gpu_mem_mb, .textures = uint32_t(textures_.size()),
+                                .targets = uint32_t(targets_.size()), .ring_kb = ring_kb, .thermal = thermal});
         presents_++;
+        ts_probe_ = perf::On() && presents_ % 120 == 0;
         g_trace_presents = presents_;
         presents_seen_.store(presents_);
         // a hitch, and where the frame's time went: what is left over is the title's own code, or waiting on the GPU
@@ -2552,12 +3111,27 @@ void MetalBackend::Present(const Surface& front) {
 }
 
 void MetalBackend::ApplySettings() {
-    if (app::Get().msaa) LOG_FIRST(1, "metal: MSAA is not implemented yet, drawn without");
+    // 1 2 3: MSAA 2x, 4x, 8x; a change drops every twin (res is current), the next draws make new ones
+    static const uint32_t kSamples[4] = {1, 2, 4, 8};
+    const uint32_t want_ms = kSamples[std::min<uint32_t>(app::Get().msaa, 3)];
+    if (want_ms != msaa_) {
+        EndEncoder();
+        msaa_ = want_ms;
+        for (auto& [key, t] : targets_) t.ms = nil, t.ms_stale = false;
+        bound_ms_ = false;
+        bound_rt_ = bound_ds_ = nullptr;
+        LOGR("metal: MSAA %ux", msaa_);
+    }
     if (app::Get().smaa) LOG_FIRST(1, "metal: SMAA is not implemented yet, drawn without");
     float aspect = app::FrameAspect();
     if (std::fabs(aspect - aspect_) > 1e-4f) {
         aspect_ = aspect;
         RescaleTargets();
+    }
+    if (const float f = g_small_target_factor.load(std::memory_order_relaxed); f != small_factor_) {
+        small_factor_ = f;
+        RescaleTargets();
+        return;
     }
     // a new scale waits until it has held for half a second: dragging would remake every target each frame
     float want = app::RenderScale(guest_h_);

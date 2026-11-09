@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "app/app.h"
+#include "app/perf.h"
 #include "core/diag.h"
 #include "core/log.h"
 #include "gpu/backend.h"
@@ -48,7 +49,7 @@ constexpr uint32_t kHeaderRing = 16u << 20;  // guest memory for header copies; 
 
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
-enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport };
+enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Kick, Gamma, ClearReport, GetReport };
 
 struct Cmd {
     Op op;
@@ -128,8 +129,15 @@ public:
 
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override {
         auto t = Clock::now();
-        SendState(s);
+        {
+            perf::Lap lap;
+            SendState(s);
+            lap.Mark(perf::kStSendState);
+            perf::Add(perf::kNStatesSent);
+            perf::NoteCore(1);
+        }
         if (Mergeable(s, prim, count, indices)) {
+            perf::Add(perf::kNMerged);
             PutMerged(prim, start, count, indices);
         } else {
             Cmd c{Op::Draw};
@@ -224,7 +232,7 @@ public:
         Wait(Submit(), WaitFor::Flush, "flush");
     }
     void Kick() override {
-        cur_->cmds.push_back(Cmd{Op::Flush});
+        cur_->cmds.push_back(Cmd{Op::Kick});
         Submit();
     }
 
@@ -364,6 +372,8 @@ private:
     void Delta(const void* field, const void* value, size_t n) {
         uint8_t* sent = reinterpret_cast<uint8_t*>(&sent_) + At(sent_, field);
         if (Same(sent, static_cast<const uint8_t*>(value), n)) return;
+        perf::Add(perf::kNDeltas);
+        perf::Add(perf::kNDeltaBytes, n);
         std::memcpy(sent, value, n);
         uint32_t head[2] = {uint32_t(At(sent_, field)), uint32_t(n)};
         size_t at = cur_->bytes.size();
@@ -506,6 +516,7 @@ private:
             case Op::Sync: inner_->Sync(c.a, 0); break;
             case Op::RecordLate: inner_->RecordLate(c.a); break;
             case Op::Flush: inner_->Flush(); break;
+            case Op::Kick: inner_->Kick(); break;
             case Op::Gamma: inner_->SetGamma(data); break;
             case Op::ClearReport: inner_->ClearReport(); break;
             case Op::GetReport: inner_->GetReport(c.a); break;

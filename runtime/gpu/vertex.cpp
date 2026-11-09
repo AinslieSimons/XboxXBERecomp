@@ -1,3 +1,6 @@
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include "gpu/vertex.h"
 
 #include <algorithm>
@@ -112,50 +115,58 @@ HostElement HostFormat(uint32_t type) {
     }
 }
 
+// written straight to the room ListIndices made (these run for every index of nearly every draw)
+template <typename... T>
+inline void put_ix(uint32_t*& w, T... v) {
+    ((*w++ = uint32_t(v)), ...);
+}
+
 // the index list for a primitive the input assembler has no topology for, or for converted vertices
 template <typename F>
 void ListIndices(uint32_t prim, uint32_t count, F local, std::vector<uint32_t>& ix, Topology& topology) {
-    ix.reserve(size_t(count) * 3);
+    ix.resize(size_t(count) * 3 + 8);  // the most any primitive makes
+    uint32_t* w = ix.data();
     topology = Topology::Triangles;
     switch (prim) {
         case 1:  // points
             topology = Topology::Points;
-            for (uint32_t i = 0; i < count; i++) ix.push_back(local(i));
+            for (uint32_t i = 0; i < count; i++) put_ix(w, local(i));
             break;
         case 2:  // line list
             topology = Topology::Lines;
-            for (uint32_t i = 0; i + 1 < count; i += 2) ix.insert(ix.end(), {local(i), local(i + 1)});
+            for (uint32_t i = 0; i + 1 < count; i += 2) put_ix(w, local(i), local(i + 1));
             break;
         case 3:  // line loop
         case 4:  // line strip
             topology = Topology::Lines;
-            for (uint32_t i = 0; i + 1 < count; i++) ix.insert(ix.end(), {local(i), local(i + 1)});
-            if (prim == 3 && count > 2) ix.insert(ix.end(), {local(count - 1), local(0)});
+            for (uint32_t i = 0; i + 1 < count; i++) put_ix(w, local(i), local(i + 1));
+            if (prim == 3 && count > 2) put_ix(w, local(count - 1), local(0));
             break;
         case 5:  // triangle list
-            for (uint32_t i = 0; i + 2 < count; i += 3) ix.insert(ix.end(), {local(i), local(i + 1), local(i + 2)});
+            for (uint32_t i = 0; i + 2 < count; i += 3) put_ix(w, local(i), local(i + 1), local(i + 2));
             break;
         case 6:  // triangle strip
             for (uint32_t i = 0; i + 2 < count; i++) {
-                if (i & 1) ix.insert(ix.end(), {local(i + 1), local(i), local(i + 2)});
-                else ix.insert(ix.end(), {local(i), local(i + 1), local(i + 2)});
+                if (i & 1) put_ix(w, local(i + 1), local(i), local(i + 2));
+                else put_ix(w, local(i), local(i + 1), local(i + 2));
             }
             break;
         case 7:   // fan
         case 10:  // polygon
-            for (uint32_t i = 1; i + 1 < count; i++) ix.insert(ix.end(), {local(0), local(i), local(i + 1)});
+            for (uint32_t i = 1; i + 1 < count; i++) put_ix(w, local(0), local(i), local(i + 1));
             break;
         case 8:  // quad list
             for (uint32_t i = 0; i + 3 < count; i += 4) {
-                ix.insert(ix.end(), {local(i), local(i + 1), local(i + 2), local(i), local(i + 2), local(i + 3)});
+                put_ix(w, local(i), local(i + 1), local(i + 2), local(i), local(i + 2), local(i + 3));
             }
             break;
         case 9:  // quad strip
             for (uint32_t i = 0; i + 3 < count; i += 2) {
-                ix.insert(ix.end(), {local(i), local(i + 1), local(i + 2), local(i + 1), local(i + 3), local(i + 2)});
+                put_ix(w, local(i), local(i + 1), local(i + 2), local(i + 1), local(i + 3), local(i + 2));
             }
             break;
     }
+    ix.resize(size_t(w - ix.data()));
 }
 
 uint32_t TypeBytes(uint32_t t) {
@@ -229,7 +240,20 @@ bool Pretransformed(const State& s) {
 IndexBounds IndexRange(const uint8_t* ip, uint32_t count) {
     uint16_t lo16 = 0xFFFF;
     uint16_t hi16 = 0;
-    for (uint32_t i = 0; i < count; i++) {
+    uint32_t i = 0;
+#if defined(__aarch64__)
+    if (count >= 16) {  // eight indices at a time
+        uint16x8_t lo = vdupq_n_u16(0xFFFF), hi = vdupq_n_u16(0);
+        for (; i + 8 <= count; i += 8) {
+            const uint16x8_t v = vreinterpretq_u16_u8(vld1q_u8(ip + i * 2));
+            lo = vminq_u16(lo, v);
+            hi = vmaxq_u16(hi, v);
+        }
+        lo16 = vminvq_u16(lo);
+        hi16 = vmaxvq_u16(hi);
+    }
+#endif
+    for (; i < count; i++) {
         uint16_t v;
         std::memcpy(&v, ip + i * 2, 2);
         lo16 = std::min(lo16, v);
@@ -409,7 +433,8 @@ constexpr uint64_t kRangedSpanSlack = 64;
 bool AssembleConverted(const State& s, const Inputs& inputs, const DrawRange& d, Assembled& out) {
     using namespace kernel;
     int nregs = inputs.nregs;
-    std::vector<uint32_t> seq(d.count);
+    static thread_local std::vector<uint32_t> seq;  // kept: an allocation for every draw otherwise
+    seq.resize(d.count);
     for (uint32_t i = 0; i < d.count; i++) seq[i] = DrawVertex(s, d, i);
     bool ranged = uint64_t(d.span) <= uint64_t(d.count) * kRangedSpanPerVertex + kRangedSpanSlack;
     uint32_t n = ranged ? d.span : d.count;
@@ -421,9 +446,24 @@ bool AssembleConverted(const State& s, const Inputs& inputs, const DrawRange& d,
         uint32_t data = mem::VirtualFromPhysical(R32(st.vb + kResData));
         uint32_t stride = StrideOf(s, inputs.layout, in);
         const uint8_t* src = static_cast<const uint8_t*>(HostPtr(data + in.offset));
-        for (uint32_t v = 0; v < n; v++) {
-            uint32_t id = ranged ? d.first_vertex + v : seq[v];
-            Convert(in.type, src + size_t(id) * stride, &out.vertices[(size_t(v) * nregs + k) * 4]);
+        // the commonest forms by their own loops (as Convert does them), not its switch for every vertex
+        float* to = out.vertices.data() + size_t(k) * 4;
+        const size_t skip = size_t(nregs) * 4;
+        const uint32_t kind = in.type & 15, parts = std::min<uint32_t>((in.type >> 4) & 15, 4);
+        if (in.type != kTypeFloat2H && kind == 2) {
+            for (uint32_t v = 0; v < n; v++, to += skip) {
+                const uint32_t id = ranged ? d.first_vertex + v : seq[v];
+                to[0] = 0, to[1] = 0, to[2] = 0, to[3] = 1;
+                std::memcpy(to, src + size_t(id) * stride, parts * 4);
+            }
+        } else if (kind == 0 && in.type != kTypeFloat2H) {
+            for (uint32_t v = 0; v < n; v++, to += skip) {
+                const uint8_t* p = src + size_t(ranged ? d.first_vertex + v : seq[v]) * stride;
+                to[0] = p[2] / 255.0f, to[1] = p[1] / 255.0f, to[2] = p[0] / 255.0f, to[3] = p[3] / 255.0f;
+            }
+        } else {
+            for (uint32_t v = 0; v < n; v++, to += skip)
+                Convert(in.type, src + size_t(ranged ? d.first_vertex + v : seq[v]) * stride, to);
         }
         out.elements[size_t(inputs.regs[k])] = {DXGI_FORMAT_R32G32B32A32_FLOAT, 0, uint16_t(k * 16)};
     }

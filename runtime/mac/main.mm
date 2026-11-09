@@ -28,6 +28,7 @@
 #include <imgui.h>
 
 #include "app/app.h"
+#include "app/perf.h"
 #include "audio/audio.h"
 #include "core/input.h"
 #include "core/log.h"
@@ -53,6 +54,7 @@ SDL_MetalView g_view = nullptr;
 void* g_layer = nullptr;
 std::atomic<bool> g_focused{true};
 std::atomic<uint32_t> g_px_w{1280}, g_px_h{720};
+std::atomic<float> g_density{1};  // pixels per macOS point: 2 on a Retina panel
 Uint32 g_apply_event = 0;
 
 std::string Narrow(const wchar_t* w) {
@@ -70,6 +72,7 @@ void UpdatePixels() {
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(g_window, &w, &h);
     if (w > 0 && h > 0) g_px_w = uint32_t(w), g_px_h = uint32_t(h);
+    if (const float density = SDL_GetWindowPixelDensity(g_window); density > 0) g_density.store(density, std::memory_order_relaxed);
 }
 
 // the display settings: windowed at the size asked (in pixels), else filling the screen
@@ -265,6 +268,7 @@ std::vector<Mode> MacModes() {
 
 // the window itself, when no size is set: what is on screen is what is drawn
 Mode OutputDefault() { return g_window ? Mode{g_px_w.load(), g_px_h.load()} : Desktop(); }
+float OutputDensity() { return g_density.load(std::memory_order_relaxed); }
 
 bool OpenSplash() { return false; }
 void SplashFirstFrame() {}
@@ -309,6 +313,7 @@ void Pace(uint32_t vblanks) {
     if (next < now - period) next = now;
     while (clock::now() + std::chrono::milliseconds(2) < next) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     while (clock::now() < next) std::this_thread::yield();
+    perf::PaceWait(std::chrono::duration<double, std::milli>(clock::now() - now).count(), std::chrono::duration<double, std::milli>(period).count());
 }
 
 // the machine, at a run's start
@@ -416,6 +421,8 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         int frames = additional / 8;
         buf.resize(size_t(frames) * 2);
         (*pull)(buf.data(), uint32_t(frames));
+        static const bool mute = std::getenv("XBE_MUTE") && *std::getenv("XBE_MUTE") == '1';  // testing: nothing from the speakers
+        if (mute) std::fill(buf.begin(), buf.end(), 0.0f);
         SDL_PutAudioStreamData(stream, buf.data(), frames * 8);
         // XBE_AUDIO_WAV=file (testing): what the mixer hands the output, as 16 bit stereo at kRate, beside the executable
         // unless a path; its header is kept current, so the file plays even if the game is killed
@@ -543,6 +550,8 @@ int main(int argc, char** argv) {
                         if (app::OverlayOpen() && app::OverlayKey(app::VirtualKey(e.key.scancode))) break;
                         if (e.key.scancode == SDL_SCANCODE_F1) app::ToggleOverlay();
                         else if (e.key.scancode == SDL_SCANCODE_F12) app::RequestScreenshot();
+                        else if (e.key.scancode == SDL_SCANCODE_F9) perf::Toggle();    // performance recording (app/perf.h)
+                        else if (e.key.scancode == SDL_SCANCODE_F10) perf::Marker();
                     }
                     break;
                 default:

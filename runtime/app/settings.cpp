@@ -24,6 +24,7 @@ namespace app {
 
 #ifdef __APPLE__
 Mode OutputDefault();
+float OutputDensity();
 #endif
 
 namespace {
@@ -471,7 +472,17 @@ float FrameAspect() {
 }
 
 float RenderScale(uint32_t guest_height) {
-    float h = Output().height * (Get().render_percent / 100.0f);
+    const Mode out = Output();
+    float h = float(out.height);
+#ifdef __APPLE__
+    // the height the picture is shown at: a 16:9 frame in a taller window has bars, and sized from the whole window it was
+    // rendered wider than the window and shrunk to fit
+    const float aspect = FrameAspect();
+    if (aspect > 0) h = std::min(h, float(out.width) / aspect);
+    // 100% is the screen's size as macOS shows it, 2560x1600 on a Retina panel of 5120x3200; 200% is every pixel. A size set by hand is in pixels
+    if (!Get().width || !Get().height) h /= OutputDensity();
+#endif
+    h *= Get().render_percent / 100.0f;
     return guest_height ? std::max(h / guest_height, 0.1f) : 1.0f;
 }
 

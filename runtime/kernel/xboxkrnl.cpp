@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <ctime>
 
+#include "app/perf.h"
 #include "app/app.h"
 #include "kernel/crypto.h"
 #include "kernel/exports.h"
@@ -256,6 +257,7 @@ KERNEL_EXPORT(151, KeStallExecutionProcessor, 1) {
 }
 
 KERNEL_EXPORT(99, KeDelayExecutionThread, 3) {
+    perf::KernelWait timed;
     int64_t interval = int64_t(R64(a[2]));
     bool alertable = a[1] & 0xFF;
     Thread* t = Current();

@@ -23,7 +23,7 @@ enum class DisplayMode : uint32_t { Fullscreen, Borderless, Windowed };
 struct Settings {
     DisplayMode display_mode = DisplayMode::Borderless;
     uint32_t width = 0, height = 0;  // 0 is the desktop mode
-    uint32_t render_percent = 100;   // of the output height
+    uint32_t render_percent = 100;   // of the output height (macOS: in points, so 200 is every pixel of a Retina panel)
     uint32_t fps_cap = 60;           // 0: only the title's present interval
     bool vsync = true;
     uint32_t aniso = 0;              // 0 as the game asks

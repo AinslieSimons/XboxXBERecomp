@@ -70,6 +70,11 @@ std::unique_ptr<Backend> CreateInterpolating(std::unique_ptr<Backend> inner);
 inline std::atomic<uint64_t> g_perf_capture_ns{0}, g_perf_wait_ns{0}, g_perf_waits{0};
 inline std::atomic<uint64_t> g_perf_wait_kind_ns[6];  // read-back, resource, fence, flush, copy, next frame
 inline std::atomic<uint64_t> g_perf_sync_late{0}, g_perf_sync_block{0};  // read-backs the title waited for, by cause
+// the title's own say: reports are to be waited for now (a screen that shows something wrong when they come a frame late)
+inline std::atomic<bool> g_reports_wait{false};
+// a pair of targets drawn smaller than the render scale (by their data addresses, colour and depth; 0 none), and by how much
+inline std::atomic<uint32_t> g_small_target[2] = {0, 0};
+inline std::atomic<float> g_small_target_factor{1.0f};
 inline std::atomic<uint32_t> g_shaders_compiled{0};  // D3DCompile calls (the shader cache missed), for the frames lines
 
 // F3: save the next frame, every draw and target, under diag::CaptureDir

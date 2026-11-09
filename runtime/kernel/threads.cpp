@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <memory>
 
+#include "app/perf.h"
 #include "kernel/kernel.h"
 
 #ifdef _WIN32
@@ -101,6 +102,7 @@ void MarkExited(Thread& t, uint32_t code) {
 }
 
 void NameHostThread(const char* name) {
+    perf::NameThread(name);
 #ifdef _WIN32
     wchar_t w[64];
     size_t i = 0;
