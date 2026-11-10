@@ -14,7 +14,9 @@
 #include <atomic>
 #include <cmath>
 #include <filesystem>
+#include <functional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -668,6 +670,8 @@ void Wheel(Settings& s) {
     }
 }
 
+void ControlInputs(Settings& s);
+
 void Controls(Settings& s) {
     if (s.keys.size() != input::kControls || s.pad_map.size() != input::kControls) return;  // sized in Get
     if (RowCheck("Keyboard plays as controller 1", &s.keyboard)) Save();
@@ -688,6 +692,12 @@ void Controls(Settings& s) {
             Save();
         }
     }
+    ControlInputs(s);
+}
+
+// every console input's keys and controller input, each rebound by pressing it
+void ControlInputs(Settings& s) {
+    if (s.keys.size() != input::kControls || s.pad_map.size() != input::kControls) return;  // sized in Get
     Section("Inputs");
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(ImGui::GetStyle().FramePadding.x, ImGui::GetStyle().CellPadding.y));
     bool table = ImGui::BeginTable("controls", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_PadOuterX);
@@ -917,12 +927,69 @@ void QuitPage() {
 }
 
 struct Page {
-    const char* name;
-    void (*draw)(Settings&);
+    std::string name;
+    std::function<void(Settings&)> draw;
 };
+
+std::string Utf8(const char16_t* t) {
+    std::string out;
+    for (; t && *t; t++) {
+        const uint32_t c = *t;
+        if (c < 0x80) {
+            out += char(c);
+        } else if (c < 0x800) {
+            out += char(0xC0 | c >> 6), out += char(0x80 | (c & 0x3F));
+        } else {
+            out += char(0xE0 | c >> 12), out += char(0x80 | (c >> 6 & 0x3F)), out += char(0x80 | (c & 0x3F));
+        }
+    }
+    return out;
+}
+
+// a section of the title's own menu (GameInfo::menu): its rows as it shows them, each a choice applied at once
+void MenuRows(const MenuSection& section) {
+    for (const MenuRow& row : *section.rows) {
+        std::vector<std::string> names;
+        for (const char16_t* c : row.choices()) names.push_back(Utf8(c));
+        if (names.empty()) continue;
+        std::vector<const char*> list;
+        for (const std::string& n : names) list.push_back(n.c_str());
+        int v = int(std::min<uint32_t>(row.get(), uint32_t(names.size() - 1)));
+        // the texts kept: the window shows the selected row's help after the row is drawn
+        static std::unordered_map<const MenuRow*, std::pair<std::string, std::string>> texts;
+        auto [it, fresh] = texts.try_emplace(&row);
+        if (fresh) it->second = {Utf8(row.label), Utf8(row.help)};
+        const std::string &label = it->second.first, &help = it->second.second;
+        if (RowChoice(label.c_str(), &v, list.data(), int(list.size()), help.empty() ? nullptr : help.c_str())) {
+            row.set(uint32_t(v));
+            Save();
+        }
+    }
+}
+
 const std::vector<Page>& Pages() {
     static const std::vector<Page> pages = [] {
-        std::vector<Page> p = {{"Display", Display}, {"Graphics", Graphics}, {"Game", [](Settings&) { GameOptions(); }}};
+        std::vector<Page> p;
+        // the title's menu, its sections in its order; Controls adds the bindings, Wheel is the full wheel page
+        if (const std::vector<MenuSection>* menu = kGame.menu ? kGame.menu() : nullptr) {
+            for (const MenuSection& section : *menu) {
+                const std::string name = Utf8(section.label);
+                if (name == "Wheel") {
+                    p.push_back({name, Wheel});
+                } else if (name == "Controls") {
+                    p.push_back({name, [sec = &section](Settings& s) {
+                                     MenuRows(*sec);
+                                     ControlInputs(s);
+                                 }});
+                } else {
+                    p.push_back({name, [sec = &section](Settings&) { MenuRows(*sec); }});
+                }
+            }
+            if (!kGame.achievements.empty()) p.push_back({"Achievements", [](Settings&) { Achievements(); }});
+            p.push_back({"Quit", [](Settings&) { QuitPage(); }});
+            return p;
+        }
+        p = {{"Display", Display}, {"Graphics", Graphics}, {"Game", [](Settings&) { GameOptions(); }}};
         if (!kGame.achievements.empty()) p.push_back({"Achievements", [](Settings&) { Achievements(); }});
         p.push_back({"General", General});
         p.push_back({"Wheel", Wheel});
@@ -1026,7 +1093,7 @@ void DrawOverlay() {
             ImDrawList* side = ImGui::GetWindowDrawList();
             if (page == i) side->AddRectFilled(pos, pos + row, kSelect);
             else if (ImGui::IsItemHovered()) side->AddRectFilled(pos, pos + row, kHover);
-            side->AddText(pos + ImVec2(pad, (row.y - em) * 0.5f), page == i ? kWhite : kText, pages[i].name);
+            side->AddText(pos + ImVec2(pad, (row.y - em) * 0.5f), page == i ? kWhite : kText, pages[i].name.c_str());
             ImGui::PopID();
         }
         ImGui::EndChild();

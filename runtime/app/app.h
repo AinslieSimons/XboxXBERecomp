@@ -168,6 +168,21 @@ struct Option {  // a setting in the settings file, flag or value
     const char* label = nullptr;  // the settings window's name for it, else the key
     const char* help = nullptr;   // a line under it in the settings window
 };
+// a title's own settings menu (PGR2's Recomp page in its options): sections of rows, each a setting shown as one of a few
+// choices. The settings window (F1) shows the same sections, rows and choices, so the two never disagree
+struct MenuRow {
+    const char16_t* label;
+    const char16_t* help;
+    std::vector<const char16_t*> (*choices)();  // at most 8
+    uint32_t (*get)();
+    void (*set)(uint32_t);
+};
+struct MenuSection {
+    const char16_t* label;
+    const char16_t* help;
+    const std::vector<MenuRow>* rows;
+};
+
 struct GameInfo {
     const wchar_t* title;        // window and splash
     const wchar_t* short_title;  // message boxes
@@ -252,6 +267,9 @@ struct GameInfo {
     // (16:10, the Steam Deck's 1280x800) is filled, the console reporting a 4:3 TV and the 2D kept 4:3 in the middle,
     // where the frame was 16:9 with bars above and below; set once the title's views follow it
     bool fills_narrow_screens = false;
+    // the title's settings menu (MenuSection): the settings window shows these sections in place of its own Display, Graphics,
+    // Game and General pages, its Controls and Wheel pages adding the key, controller and wheel bindings under them
+    const std::vector<MenuSection>* (*menu)() = nullptr;
     // the title's 3D views follow FrameAspect when it changes (PGR2 reshapes its cameras): in a widescreen boot, a choice
     // between 16:9 and filling the screen applies at once; 4:3 against widescreen still waits for the next start
     bool fill_follows_live = false;
