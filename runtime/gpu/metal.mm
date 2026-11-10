@@ -3002,8 +3002,8 @@ void MetalBackend::Present(const Surface& front) {
             enc_depth_ = nil;
             const float w = float(drawable.texture.width), h = float(drawable.texture.height);
             if (frame) {
-                // the frame at its shape (16:9 or 4:3, ultrawide the screen's), centred on black
-                float aspect = app::FrameAspect();
+                // the frame at the shape its targets were made for (16:9 or 4:3, ultrawide the screen's), centred on black
+                float aspect = aspect_;
                 float vw = std::min(w, h * aspect), vh = vw / aspect;
                 [enc_ setViewport:MTLViewport{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1}];
                 [enc_ setScissorRect:MTLScissorRect{0, 0, NSUInteger(w), NSUInteger(h)}];

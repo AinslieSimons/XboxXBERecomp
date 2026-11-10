@@ -1240,7 +1240,7 @@ void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const u
     uint32_t gw = rt.ok ? rt.w : zs.w, gh = rt.ok ? rt.h : zs.h;
     std::vector<Shaded> verts(as.vertex_count);
     std::vector<float> point_size(sprites ? as.vertex_count : 0, 0.0f);  // oPts, 0 for D3DRS_POINTSIZE
-    // ultrawide (FRAME_ASPECT_X100 over GameInfo::hud_aspect): 2D is squeezed into the centred part, a corner on the
+    // ultrawide (FRAME_ASPECT_X100 over app::HudAspect): 2D is squeezed into the centred part, a corner on the
     // frame's left or right edge staying there, a depth tested draw only where at the near plane (rhw 0.25 or more), as
     // the renderers' HudSqueeze and vertex shader do
     float squeeze = 1;
@@ -1256,8 +1256,8 @@ void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const u
             if (s.textures[size_t(i)] && Describe(s.textures[size_t(i)], sd) && !FindReplacement(sd.data)) Sharpen2D(sd);
         }
     if ((as.pretransformed || screen) && slot[0] >= 0 && rt.ok && (rt.h == 480 || rt.h == 576) && rt.w >= rt.h &&
-        app::FrameAspect() > app::kGame.hud_aspect + 1e-3f)
-        squeeze = app::kGame.hud_aspect / app::FrameAspect();
+        app::FrameAspect() > app::HudAspect() + 1e-3f)
+        squeeze = app::HudAspect() / app::FrameAspect();
     // State::pillar_aspect: squeezed whole to that shape (the renderers' Pillarbox)
     const bool pillar = s.pillar_aspect > 0 && (as.pretransformed || screen) && slot[0] >= 0 && rt.ok &&
                         (rt.h == 480 || rt.h == 576) && rt.w >= rt.h && app::FrameAspect() > s.pillar_aspect + 1e-3f &&
