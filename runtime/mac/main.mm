@@ -513,7 +513,12 @@ int main(int argc, char** argv) {
     if (!app::FindGame(game)) return 1;
 
     std::string title = app::Narrow(app::kGame.title);
-    app::g_window = SDL_CreateWindow(title.c_str(), 1280, 720, SDL_WINDOW_METAL | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE);
+    // the window at the screen's shape (1280 wide, 1280x800 on a 16:10 display): the game reads its TV's shape once, as it
+    // boots, from the window, and a 16:9 window made full screen on a 16:10 display stayed 16:9 with bars
+    int win_h = 720;
+    if (const SDL_DisplayMode* dm = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay()); dm && dm->w > 0 && dm->h > 0)
+        win_h = std::clamp(int(std::lround(1280.0 * dm->h / dm->w)), 540, 960);
+    app::g_window = SDL_CreateWindow(title.c_str(), 1280, win_h, SDL_WINDOW_METAL | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE);
     if (!app::g_window) {
         LOGE("no window: %s", SDL_GetError());
         return 1;

@@ -220,7 +220,7 @@ constexpr MTLPixelFormat kBgra = MTLPixelFormatBGRA8Unorm;
 constexpr MTLPixelFormat kDepth = MTLPixelFormatDepth32Float_Stencil8;
 constexpr uint64_t kStaleFrames = 8;       // frames a target may go unused and still be read back
 constexpr uint32_t kRingBytes = 96u << 20;  // per frame: vertices, indices, constants, uploads
-constexpr int kFramesInFlight = 3;
+constexpr int kFramesInFlight = 4;  // rings: the frame being written and up to three the GPU has yet to finish
 constexpr int kLateSlots = 3;              // copies in flight per surface locked without a wait
 constexpr uint32_t kVisSlots = 1u << 16;   // visibility counters, 8 bytes each
 constexpr uint32_t kVertexBufferBase = 1;  // buffer 0 holds the constants
@@ -791,7 +791,12 @@ bool MetalBackend::Init(uint32_t width, uint32_t height) {
         layer_.framebufferOnly = NO;
         layer_.maximumDrawableCount = 3;
         queue_ = [dev_ newCommandQueue];
-        frames_ = dispatch_semaphore_create(kFramesInFlight);
+        // one permit per ring but the one the next frame writes: a frame waits after it is committed, so with a permit per
+        // ring the fourth frame wrote the first one's ring while the GPU still drew it (under GPU load: the start of the
+        // frame, the race's mirror, drawn from the next frame's vertices and constants: coloured blocks, a flickering HUD)
+        // XBE_FRAMES_AHEAD=1..3 (testing): fewer frames queued
+        static const long ahead = std::getenv("XBE_FRAMES_AHEAD") ? std::clamp(std::atol(std::getenv("XBE_FRAMES_AHEAD")), 1L, long(kFramesInFlight - 1)) : kFramesInFlight - 1;
+        frames_ = dispatch_semaphore_create(ahead);
         for (auto& r : rings_) r = [dev_ newBufferWithLength:kRingBytes options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
         ring_ = rings_[0];
         vis_ = [dev_ newBufferWithLength:kVisSlots * 8 options:MTLResourceStorageModeShared];
@@ -3002,10 +3007,26 @@ void MetalBackend::Present(const Surface& front) {
             enc_depth_ = nil;
             const float w = float(drawable.texture.width), h = float(drawable.texture.height);
             if (frame) {
-                // the frame at the shape its targets were made for (16:9 or 4:3, ultrawide the screen's), centred on black
-                float aspect = aspect_;
+                // the frame at its own shape (16:9 or 4:3, ultrawide the screen's), centred on black: its target's, so a frame
+                // drawn before a change of shape reached the targets is not shown stretched
+                float aspect = frame.height ? float(frame.width) / float(frame.height) : aspect_;
                 float vw = std::min(w, h * aspect), vh = vw / aspect;
                 [enc_ setViewport:MTLViewport{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1}];
+                // each size the picture passes through, when one changes: the window's, the layer's, the drawable's, the
+                // frame's and where it is put (a picture scaled by the system or between sizes shows here)
+                static uint64_t sizes = 0;
+                static int told = 0;
+                const CGSize bounds = layer_.bounds.size;
+                const uint64_t key = uint64_t(w) << 48 ^ uint64_t(h) << 32 ^ uint64_t(frame.width) << 16 ^ frame.height ^
+                                     uint64_t(bounds.width) << 40 ^ uint64_t(layer_.contentsScale * 8) << 56;
+                if (key != sizes && told++ < 40) {
+                    sizes = key;
+                    LOGR("metal: sizes: layer %.0fx%.0f points at %.2f, drawable %.0fx%.0f (wanted %ux%u), frame %lux%lu (%.3f:1, "
+                         "targets %.3f:1, scale %.2f), shown %.0fx%.0f at %.0f,%.0f",
+                         bounds.width, bounds.height, layer_.contentsScale, w, h, px.width, px.height,
+                         (unsigned long)frame.width, (unsigned long)frame.height, aspect, aspect_, scale_, vw, vh, (w - vw) / 2,
+                         (h - vh) / 2);
+                }
                 [enc_ setScissorRect:MTLScissorRect{0, 0, NSUInteger(w), NSUInteger(h)}];
                 float uv[4] = {0, 0, 1, 1};
                 Blit(frame, uv, {.gamma = gamma_, .final = true});

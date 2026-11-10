@@ -129,6 +129,10 @@ std::string FieldAttr(const std::string& field, const std::string& sem) {
     if (sem == "SV_Position") return "[[position, invariant]]";
     if (sem.rfind("ATTR", 0) == 0) return "[[attribute(" + sem.substr(4) + ")]]";
     if (field.find(" e") != std::string::npos && sem == "TEXCOORD5") return "[[center_no_perspective]]";
+    // texture coordinates at a covered sample: with MSAA a pixel a quad only partly covers is shaded at its centre, which
+    // may lie outside the quad, and coordinates carried out there read past the quad's edge; without MSAA the same as the
+    // centre. (Not the cause of the thin line beside PGR2's tachometer numerals with MSAA, which it left as it was.)
+    if (sem.size() == 9 && sem.rfind("TEXCOORD", 0) == 0 && sem[8] >= '0' && sem[8] <= '3') return "[[centroid_perspective]]";
     return "";
 }
 
