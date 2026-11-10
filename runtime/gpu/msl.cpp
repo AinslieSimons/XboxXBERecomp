@@ -326,6 +326,15 @@ std::string PixelMsl(const std::string& hlsl) {
             pass += ", " + g.name + ", " + g.name + "_colour, " + g.name + "_tex";
             continue;
         }
+        if (g.type == "TexAo") {  // PixelKey::ao: the triangle, where on it, and the occlusion buffers (gpu/baked_ao.h)
+            const std::string n = g.name;
+            const std::string params = "uint " + n + "_prim, float3 " + n + "_bary, const device uint2* " + n + "_tri, const device uchar* " + n + "_val";
+            extra += (extra.empty() ? "" : ", ") + params;
+            handles += ", uint " + n + "_prim [[primitive_id]], float3 " + n + "_bary [[barycentric_coord]], const device uint2* " + n +
+                       "_tri [[buffer(3)]], const device uchar* " + n + "_val [[buffer(4)]]";
+            pass += ", " + n + "_prim, " + n + "_bary, " + n + "_tri, " + n + "_val";
+            continue;
+        }
         const bool smp = g.type == "sampler";
         extra += (extra.empty() ? "" : ", ") + g.type + " " + g.name;
         handles += ", " + HandleType(g.type) + " " + g.name + (smp ? " [[sampler(" : " [[texture(") + std::to_string(g.slot) + ")]]";

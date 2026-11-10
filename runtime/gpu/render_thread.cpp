@@ -30,6 +30,7 @@
 #include "core/diag.h"
 #include "core/log.h"
 #include "gpu/backend.h"
+#include "gpu/baked_ao.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
 
@@ -58,6 +59,7 @@ struct Cmd {
     uint32_t data = 0, size = 0;  // bytes in Batch::bytes
     int32_t vs = -1, ps = -1;     // index in Batch::vs / ps: the shader changed
     bool joinable = false;        // a triangle list the next draw with the same state may add to (GameInfo::merge_draws)
+    uint32_t ao = 0;              // the draw's baked occlusion (gpu/baked_ao.h), 0 none
     Surface s1, s2;
 };
 
@@ -136,7 +138,13 @@ public:
             perf::Add(perf::kNStatesSent);
             perf::NoteCore(1);
         }
-        if (Mergeable(s, prim, count, indices)) {
+        // read before the draw is queued: its indices' own address names it, the queue's copy does not
+#ifdef __APPLE__
+        const uint32_t ao = ao::Lookup(s, prim, start, count, indices);
+#else
+        const uint32_t ao = 0;
+#endif
+        if (!ao && Mergeable(s, prim, count, indices)) {
             perf::Add(perf::kNMerged);
             PutMerged(prim, start, count, indices);
         } else {
@@ -144,6 +152,7 @@ public:
             c.a = prim;
             c.b = start;
             c.c = count;
+            c.ao = ao;
             if (indices) {
                 c.d = 1;
                 c.data = Put(indices, size_t(count) * 2);
@@ -509,7 +518,11 @@ private:
                 if (c.ps >= 0) state_.ps = b.ps[size_t(c.ps)];
                 break;
             }
-            case Op::Draw: inner_->Draw(state_, c.a, c.b, c.c, c.d ? data : nullptr); break;
+            case Op::Draw:
+                ao::g_draw = c.ao;
+                inner_->Draw(state_, c.a, c.b, c.c, c.d ? data : nullptr);
+                ao::g_draw = 0;
+                break;
             case Op::Clear: inner_->Clear(state_, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d); break;
             case Op::Copy: inner_->Copy(c.s1, c.s2, c.a, c.b, c.c); break;
             case Op::Present: inner_->Present(c.s1); break;

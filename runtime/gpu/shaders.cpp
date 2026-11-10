@@ -67,6 +67,7 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 vattr[16];  // the v registers a draw gives no stream
     float4 zclip;  // the depth clip planes
     float4 trace[8];  // kTexTraced
+    float4 aoc;  // PixelKey::ao
 };
 )";
 
@@ -526,6 +527,27 @@ uint alphacover(float a, uint samples) {
     if (a <= 0 || c <= 0) discard;
     uint n = min((uint)ceil(c * samples), samples);
     return (1u << n) - 1;
+}
+)";
+
+// PixelKey::ao, written for Metal (gpu/msl.cpp passes the triangle, its barycentrics and the buffers in): the value baked
+// at the pixel's place on its triangle, from the three grid points around it (gpu/baked_ao.h), lightened by aoc.y
+const char* kPsBakedAo = R"(
+float bakedao_one(const device uchar* val, uint first, uint n, uint r, uint c) {
+    c = min(c, n - r);
+    return float(val[first + r * (n + 1) - r * (r - 1) / 2 + c]);
+}
+float bakedao_at(uint prim, float3 bary, const device uint2* tri, const device uchar* val) {
+    uint2 t = tri[uint(aoc.x) + prim];
+    uint n = max(t.y, 1u);
+    float3 w = (aoc.z != 0 && (prim & 1u) != 0) ? bary.yxz : bary;
+    float fu = w.y * float(n), fv = w.z * float(n);
+    uint r = min(uint(fu), n - 1), c = min(uint(fv), n - 1);
+    float a = fu - float(r), b = fv - float(c), v;
+    if (r + c >= n) v = bakedao_one(val, t.x, n, r, c);
+    else if (a + b <= 1) v = bakedao_one(val, t.x, n, r, c) * (1 - a - b) + bakedao_one(val, t.x, n, r + 1, c) * a + bakedao_one(val, t.x, n, r, c + 1) * b;
+    else v = bakedao_one(val, t.x, n, r + 1, c + 1) * (a + b - 1) + bakedao_one(val, t.x, n, r + 1, c) * (1 - b) + bakedao_one(val, t.x, n, r, c + 1) * (1 - a);
+    return mix(1.0, v / 255.0, aoc.y);
 }
 )";
 
@@ -1036,6 +1058,7 @@ std::string PixelHlsl(const PixelKey& k) {
             s += kPsTraced;
             break;
         }
+    if (k.ao) s += std::string("TexAo bakedao : register(t9);\n") + kPsBakedAo;
     if (k.wbuf) {
         // the NV2A's Z_PERSPECTIVE: the pixel's w, the polygon offset in its units and its slope, stored whole (xemu
         // interpolates w linearly on the screen, which puts long triangles reaching the camera in front of everything)
@@ -1053,6 +1076,7 @@ std::string PixelHlsl(const PixelKey& k) {
     if (k.programmable) s += "    if (misc.w == 0) v1 = float4(0, 0, 0, 1);\n";
     s += "    float4 fogin = float4(fogcolor.rgb, saturate(i.fogamt));\n";
     std::string body;
+    if (k.ao) body += "float aov = bakedao_at(bakedao_prim, bakedao_bary, bakedao_tri, bakedao_val);\n";
     if (k.programmable) {
         // each stage's value as the console gives it before a later stage reads it (texbem, texm3x* ...)
         for (int i = 0; i < 4; i++) {
@@ -1081,6 +1105,7 @@ std::string PixelHlsl(const PixelKey& k) {
             ps.code += wc + wa + "}\n";
         }
         body += ps.code;
+        if (k.ao) body += "r0.rgb *= aov;\n";
         if (k.final_abcd || k.final_efg) {
             ps.stage = 8;
             uint32_t fl = k.final_efg & 0xFF;
@@ -1125,9 +1150,11 @@ std::string PixelHlsl(const PixelKey& k) {
             std::string a = f[4] <= 1 ? std::string("cur.a") : FfOp(f[4], FfArg(f[5], i, true), FfArg(f[6], i, true), FfArg(f[7], i, true), i, true);
             body += F("{ float3 c3 = saturate(%s); float c1 = saturate(%s); %s = float4(c3, c1); }\n", rgb.c_str(), a.c_str(), dst);
         }
+        if (k.ao) body += "cur.rgb *= aov;\n";
         body += "if (misc.w != 0) cur.rgb = saturate(cur.rgb + v1.rgb);\n";
         body += "float4 outc = float4(lerp(fogin.rgb, cur.rgb, fogin.a), cur.a);\n";
     }
+    if (k.ao) body += "if (aoc.w == 1) outc = float4(aov, aov, aov, 1);\n";  // XBE_AO_DEBUG=1: the occlusion alone
     for (int i = 0; i < 4; i++)  // XBE_TRACE_DEBUG: the trace's own picture, whatever the combiners make of it
         if (k.tex[i].flags & kTexTraced) body += F("if (trace[3].w != 0) outc = float4(t%d.rgb, 1);\n", i);
     body += (k.coverage ? F("cov = alphacover(outc.a, %u);\n", k.coverage) : std::string("alphatest(outc.a);\n")) + Hooks().Output() + "return outc;\n}\n";

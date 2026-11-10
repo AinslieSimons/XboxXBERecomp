@@ -30,6 +30,7 @@
 #include "core/diag.h"
 #include "core/log.h"
 #include "gpu/backend.h"
+#include "gpu/baked_ao.h"
 #include "gpu/d3d_common.h"
 #include "app/perf.h"
 #include "gpu/msl.h"
@@ -2690,6 +2691,10 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         lap.Mark(perf::kStTargets);
         PixelKey pk = MakePixelKey(s, stages.info);
         pk.quad = sh.quad;
+        // baked occlusion for a draw of the static world (gpu/baked_ao.h)
+        const float ao_strength = ao::g_strength.load(std::memory_order_relaxed);
+        const bool baked = ao::g_draw && ao_strength > 0 && !draw_2d_ && ao::Triangles();
+        if (baked) pk.ao = 1;
         const bool traced = adjust.trace_reflect && trace_live_ >= 0 && pk.programmable && pk.tex[3].kind == kTexCube && !pk.tex[3].shadow;
         if (TraceLogFrame() && adjust.trace_reflect)
             LOGR("trace draw: vs %08X rt %08X %s (scene %d, self %u of %zu -> object %u, programmable %u, stage 3 kind %u) from %.4g %.4g %.4g %.4g / %.4g %.4g %.4g %.4g / %.4g %.4g %.4g %.4g",
@@ -2772,6 +2777,13 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             if (span == kSpanViewport) c.hud[0] = 1;      // a pass filling its own viewport
         }
         SqueezeBeyond(s, c.hud);
+        if (baked) {
+            // a strip drawn as one: Apple GPUs give its odd triangles' barycentrics in the order the bake's list
+            // (gpu/vertex.cpp ListIndices) has them; XBE_AO_FLIP=1 swaps the first two (diagonal seams on walls when wrong)
+            static const bool flip = std::getenv("XBE_AO_FLIP") && *std::getenv("XBE_AO_FLIP") == '1';
+            static const float debug = std::getenv("XBE_AO_DEBUG") && *std::getenv("XBE_AO_DEBUG") == '1' ? 1.0f : 0.0f;
+            c.aoc[0] = float(ao::g_draw - 1), c.aoc[1] = std::min(ao_strength, 1.0f), c.aoc[2] = a.strip && flip ? 1.0f : 0.0f, c.aoc[3] = debug;
+        }
         if (traced) {
             // the filter's place in the scene from console pixels, here from the target's own (as the scissor below scales)
             const Target* tb = bound_rt_ ? bound_rt_ : bound_ds_;
@@ -2793,6 +2805,10 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         lap.Mark(perf::kStEncoderState);
         UploadConstants(s, sh, k, stages, size, c);
         lap.Mark(perf::kStConstants);
+        if (baked) {
+            [enc_ setFragmentBuffer:ao::Triangles() offset:0 atIndex:3];
+            [enc_ setFragmentBuffer:ao::Values() offset:0 atIndex:4];
+        }
         if (traced) {
             [enc_ setFragmentAccelerationStructure:trace_[trace_live_].as atBufferIndex:1];
             [enc_ setFragmentBuffer:trace_[trace_live_].colours offset:0 atIndex:2];

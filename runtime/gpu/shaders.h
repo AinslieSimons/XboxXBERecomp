@@ -58,6 +58,7 @@ struct PixelKey {
     uint32_t quad = 0;       // a screen quad: QuadHlsl
     uint32_t wbuf = 0;       // D3DZB_USEW: the depth written is the pixel's w (DrawConstants::wdepth)
     uint32_t coverage = 0;   // Settings::alpha_coverage: the target's samples, an alpha test becomes partial coverage
+    uint32_t ao = 0;         // baked occlusion (gpu/baked_ao.h, Metal): the colour before fog times it, by DrawConstants::aoc
     bool operator==(const PixelKey& o) const;
 };
 
@@ -147,6 +148,10 @@ struct DrawConstants {
     // kTexTraced: rows 0 to 2 the pixel's place in the scene from (x w, y w, w, 1), x and y the host pixel; row 3 on, the
     // longest ray, how far from the pixel it starts; rows 4 to 6 the cube's direction turned into the scene
     float trace[8][4];
+    // PixelKey::ao: the draw's first triangle in the occlusion buffers, its strength (0 to 1), odd strip triangles'
+    // barycentrics in the other order (1), the occlusion alone in place of the
+    // colour (1, XBE_AO_DEBUG)
+    float aoc[4];
 };
 
 }  // namespace gpu
