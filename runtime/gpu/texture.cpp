@@ -701,6 +701,21 @@ std::vector<uint32_t> UpscalePicture(const std::vector<uint32_t>& bgra, uint32_t
             out[size_t(y) * size_t(ow) + size_t(x)] = o | oa << 24;
         }
     }
+    // a clear or faint texel reads no more than itself at its centre, as the game's own does: a title drawing a piece of
+    // a sheet ends its quad there, the next piece's edge (and its faint fringe) a texel on (PGR2's tachometer numerals,
+    // 0 2 4 ... packed in a row), and the console's pixel centres never read past it. The edge the enlarging moves half a
+    // texel out across that texel read there as a faint line beside each numeral. The middle pixels of each texel under
+    // half covered (where a bilinear read at its centre lands) keep at most its alpha; its outer ones the smoothed edge
+    for (int ty = 0; ty < h; ty++)
+        for (int tx = 0; tx < w; tx++) {
+            const uint32_t limit = bgra[size_t(ty) * width + size_t(tx)] >> 24;
+            if (limit >= 128) continue;
+            for (int y = ty * s + std::max(s / 2 - 1, 0); y <= ty * s + s / 2 && y < oh; y++)
+                for (int x = tx * s + std::max(s / 2 - 1, 0); x <= tx * s + s / 2 && x < ow; x++) {
+                    uint32_t& p = out[size_t(y) * size_t(ow) + size_t(x)];
+                    if ((p >> 24) > limit) p = (p & 0x00FFFFFFu) | limit << 24;
+                }
+        }
     return out;
 }
 
