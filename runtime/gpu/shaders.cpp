@@ -593,6 +593,28 @@ float4 traced(raytracing::primitive_acceleration_structure as, const device uint
     }
     // a hit on itself cast on from just past it, twice at most (the hardware's fast path: no test per candidate)
     uint self = uint(trace[7].y);
+    // the other cars' bounds first (trace[7].w of them, from word trace[7].z): a ray that meets none is the cube's (most
+    // rays: sky, road, buildings), and one that does looks only between the first box it enters and the last it leaves,
+    // past its own car, whose dense triangles about its start made every ray slow
+    uint nb = min(uint(trace[7].w), 64u);
+    if (nb > 0 && trace[3].w == 0) {
+        uint at = uint(trace[7].z);
+        float3 inv = 1.0 / d;
+        float enter = trace[3].y, leave = 0;
+        for (uint i = 0; i < nb; i++) {
+            if (i + 1 == self) continue;
+            const device uint* bx = tri + at + i * 6;
+            float3 lo = float3(as_type<float>(bx[0]), as_type<float>(bx[1]), as_type<float>(bx[2]));
+            float3 hi = float3(as_type<float>(bx[3]), as_type<float>(bx[4]), as_type<float>(bx[5]));
+            float3 t0 = (lo - r.origin) * inv, t1 = (hi - r.origin) * inv;
+            float3 a3 = min(t0, t1), b3 = max(t0, t1);
+            float a = max(max(a3.x, a3.y), max(a3.z, 0.0)), b = min(min(b3.x, b3.y), min(b3.z, r.max_distance));
+            if (a <= b) enter = min(enter, a), leave = max(leave, b);
+        }
+        if (leave <= 0) return env;
+        r.min_distance = max(enter - 0.05, 0.0);
+        r.max_distance = min(leave + 0.05, trace[3].y);
+    }
     float went = 0;
     auto h = hit.intersect(r, as);
     for (int k = 0; k < 2 && self != 0 && h.type != raytracing::intersection_type::none && (tri[h.primitive_id * 10 + 9] >> 16) == self; k++) {

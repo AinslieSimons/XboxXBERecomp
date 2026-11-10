@@ -747,6 +747,7 @@ private:
         id<MTLAccelerationStructure> as;
         std::vector<id<MTLTexture>> tex;  // scene_tex_ as it was built
         std::vector<uint32_t> object;     // each draw's object (by DrawAdjust::trace_draw)
+        uint32_t box_at = 0, boxes = 0;   // each object's bounds (six floats, object n at n - 1) in colours, from word box_at
     };
     TraceSlot trace_[kFramesInFlight];
     std::vector<float> scene_xyz_;         // three x y z per triangle, in the world
@@ -769,6 +770,7 @@ private:
     bool trace_ok_ = false;                // the device traces rays from fragment functions
     const DrawAdjust* carried_ = nullptr;  // the filter's answer for a draw drawn again with another stage 3
     void AddToScene(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, const DrawAdjust& a);
+    uint64_t trace_gather_ns_ = 0, trace_build_ns_ = 0, trace_frames_ = 0, trace_tris_ = 0;  // the traced scene's cost (log)
     void BuildScene();
 };
 
@@ -2284,6 +2286,7 @@ void MetalBackend::AddToScene(const State& s, uint32_t prim, uint32_t start, uin
 void MetalBackend::BuildScene() {
     trace_live_ = -1;
     const uint32_t tris = uint32_t(scene_colour_.size() / kTraceWords);
+    const auto build_start = std::chrono::steady_clock::now();
     if (trace_ok_ && tris) {
         TraceSlot& t = trace_[frame_slot_];
         // the draws grouped into objects (a car's body, wheels, lights and glass): the largest first, each other joining
@@ -2311,11 +2314,27 @@ void MetalBackend::BuildScene() {
             if (!t.object[i]) heads.push_back(i), t.object[i] = uint32_t(std::min<size_t>(heads.size(), 0xFFFF));
             for (size_t k = d.first; k < d.end; k++) scene_colour_[k * kTraceWords + 9] |= t.object[i] << 16;
         }
-        const size_t vbytes = size_t(tris) * 36, cbytes = size_t(tris) * kTraceWords * 4;
+        // each object's bounds, a little wider, after the triangles: a ray tests them before the scene (traced())
+        std::vector<float> box(heads.size() * 6);
+        for (size_t o = 0; o < heads.size(); o++)
+            for (int k = 0; k < 3; k++) box[o * 6 + size_t(k)] = 1e30f, box[o * 6 + 3 + size_t(k)] = -1e30f;
+        for (size_t i = 0; i < scene_draws_.size(); i++) {
+            const SceneDraw& d = scene_draws_[i];
+            const uint32_t o = t.object[i];
+            if (d.end == d.first || !o || o > heads.size()) continue;
+            for (int k = 0; k < 3; k++) {
+                box[(o - 1) * 6 + size_t(k)] = std::min(box[(o - 1) * 6 + size_t(k)], d.lo[k] - 0.1f);
+                box[(o - 1) * 6 + 3 + size_t(k)] = std::max(box[(o - 1) * 6 + 3 + size_t(k)], d.hi[k] + 0.1f);
+            }
+        }
+        t.box_at = tris * uint32_t(kTraceWords);
+        t.boxes = uint32_t(heads.size());
+        const size_t vbytes = size_t(tris) * 36, cbytes = size_t(tris) * kTraceWords * 4 + box.size() * 4;
         if (!t.verts || t.verts.length < vbytes) t.verts = [dev_ newBufferWithLength:vbytes * 3 / 2 options:MTLResourceStorageModeShared];
         if (!t.colours || t.colours.length < cbytes) t.colours = [dev_ newBufferWithLength:cbytes * 3 / 2 options:MTLResourceStorageModeShared];
         std::memcpy(t.verts.contents, scene_xyz_.data(), vbytes);
-        std::memcpy(t.colours.contents, scene_colour_.data(), cbytes);
+        std::memcpy(t.colours.contents, scene_colour_.data(), size_t(tris) * kTraceWords * 4);
+        std::memcpy(static_cast<uint8_t*>(t.colours.contents) + size_t(tris) * kTraceWords * 4, box.data(), box.size() * 4);
         MTLAccelerationStructureTriangleGeometryDescriptor* g = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
         g.vertexBuffer = t.verts;
         g.vertexStride = 12;
@@ -2341,6 +2360,16 @@ void MetalBackend::BuildScene() {
             told = true;
             LOGR("metal: ray traced reflections: the first scene has %u triangles", tris);
         }
+    }
+    // the scene's cost on this thread, every 10 s while there is one
+    if (tris) {
+        trace_build_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - build_start).count());
+        trace_frames_++, trace_tris_ += tris;
+    }
+    if (trace_frames_ && presents_ % 600 == 0) {
+        LOGR("metal: traced scene: %llu triangles, gathering %.2f ms and building %.2f ms a frame (render thread)",
+             (unsigned long long)(trace_tris_ / trace_frames_), trace_gather_ns_ / 1e6 / trace_frames_, trace_build_ns_ / 1e6 / trace_frames_);
+        trace_frames_ = trace_tris_ = trace_gather_ns_ = trace_build_ns_ = 0;
     }
     scene_xyz_.clear();
     scene_colour_.clear();
@@ -2664,7 +2693,11 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         if (g_draw_filter && !g_draw_filtered) g_draw_filter(s, adjust);
         if (adjust.skip) return;
         if (!g_draw_filtered) perf::CountDraw(prim, count);
-        if (adjust.trace_scene) AddToScene(s, prim, start, count, indices, adjust);
+        if (adjust.trace_scene) {
+            const auto t0 = std::chrono::steady_clock::now();
+            AddToScene(s, prim, start, count, indices, adjust);
+            trace_gather_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        }
         if (adjust.stage3) {
             g_draw_filtered = true;
             carried_ = &adjust;
@@ -2798,7 +2831,8 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
                 c.trace[r][0] = f[0] / px, c.trace[r][1] = f[1] / py, c.trace[r][2] = f[2], c.trace[r][3] = f[3];
                 std::memcpy(c.trace[4 + r], adjust.trace_turn + r * 4, 16);
             }
-            c.trace[3][0] = 1, c.trace[3][1] = adjust.trace_range[0], c.trace[3][2] = adjust.trace_range[1];
+            static const bool noray = std::getenv("XBE_TRACE_NORAY") != nullptr;  // testing: the traced draws without their rays
+            c.trace[3][0] = noray ? 0.0f : 1.0f, c.trace[3][1] = adjust.trace_range[0], c.trace[3][2] = adjust.trace_range[1];
             static const float debug = std::getenv("XBE_TRACE_DEBUG") ? float(std::atoi(std::getenv("XBE_TRACE_DEBUG"))) : 0.0f;
             c.trace[3][3] = debug;
             // the triangles' faces: anticlockwise in front, as PGR2's cars are wound (XBE_TRACE_CULL=0 none, 1 clockwise)
@@ -2806,6 +2840,8 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             c.trace[7][0] = cull;
             const auto& object = trace_[trace_live_].object;
             c.trace[7][1] = adjust.trace_self && adjust.trace_self <= object.size() ? float(object[adjust.trace_self - 1]) : 0.0f;
+            static const bool nobox = std::getenv("XBE_TRACE_NOBOX") != nullptr;  // testing: every ray into the scene
+            c.trace[7][2] = float(trace_[trace_live_].box_at), c.trace[7][3] = nobox ? 0.0f : float(trace_[trace_live_].boxes);
         }
         lap.Mark(perf::kStEncoderState);
         UploadConstants(s, sh, k, stages, size, c);
@@ -2995,6 +3031,19 @@ void MetalBackend::Present(const Surface& front) {
         cost_.drawable_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_start).count();
         id<MTLTexture> frame = t ? t->res : nil;
         EndEncoder();
+        // XBE_DUMP_CUBES=frame (testing): that frame's square 128 and 256 targets (reflection cube faces) as screenshots
+        static const uint64_t dump_cubes = std::getenv("XBE_DUMP_CUBES") ? std::strtoull(std::getenv("XBE_DUMP_CUBES"), nullptr, 10) : 0;
+        if (dump_cubes && presents_ == dump_cubes) {
+            int n = 0;
+            for (auto& [key, tg] : targets_) {
+                if (tg.depth || tg.gw != tg.gh || (tg.gw != 128 && tg.gw != 256) || !tg.res || n >= 48) continue;
+                std::vector<uint8_t> px;
+                if (!ReadBack(tg.res, tg.w, tg.h, px)) continue;
+                LOGR("metal: cube dump %d: target %08X %ux%u", n++, tg.data, tg.gw, tg.gh);
+                app::SaveScreenshot(std::move(px), tg.w, tg.h);
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));  // screenshots are named by the time
+            }
+        }
         if (drawable) {
             MTLRenderPassDescriptor* d = [MTLRenderPassDescriptor renderPassDescriptor];
             d.colorAttachments[0].texture = drawable.texture;
