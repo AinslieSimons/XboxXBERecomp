@@ -399,12 +399,23 @@ short GetAsyncKeyState(int vk) {
 
 HWND GetForegroundWindow() { return app::g_focused || std::getenv("XBE_KEYS") ? app::g_window : nullptr; }
 
+// a system alert (CFUserNotification), not NSAlert: NSAlert loads its nib's system images, which on macOS 27 asserts
+// in an executable outside an app bundle (SDL's message box crashed at start when the game was not found)
 int MessageBoxW(HWND, const wchar_t* text, const wchar_t* title, unsigned type) {
     std::string t = app::Narrow(text), c = app::Narrow(title);
     LOGW("%s: %s", c.c_str(), t.c_str());
-    if (type & MB_YESNO) return IDYES;  // no question stops a start on macOS yet: the log has what it asked
-    SDL_ShowSimpleMessageBox((type & MB_ICONERROR) ? SDL_MESSAGEBOX_ERROR : SDL_MESSAGEBOX_WARNING, c.c_str(), t.c_str(), nullptr);
-    return IDOK;
+    logx::Flush();
+    CFStringRef head = CFStringCreateWithCString(nullptr, c.c_str(), kCFStringEncodingUTF8);
+    CFStringRef body = CFStringCreateWithCString(nullptr, t.c_str(), kCFStringEncodingUTF8);
+    const bool ask = (type & MB_YESNO) != 0;
+    CFOptionFlags answer = kCFUserNotificationDefaultResponse;
+    CFUserNotificationDisplayAlert(0, (type & MB_ICONERROR) ? kCFUserNotificationStopAlertLevel : kCFUserNotificationCautionAlertLevel,
+                                   nullptr, nullptr, nullptr, head ? head : CFSTR("Error"), body, ask ? CFSTR("Yes") : nullptr,
+                                   ask ? CFSTR("No") : nullptr, nullptr, &answer);
+    if (head) CFRelease(head);
+    if (body) CFRelease(body);
+    if (!ask) return IDOK;
+    return (answer & 3) == kCFUserNotificationDefaultResponse ? IDYES : IDNO;
 }
 
 // ---- sound

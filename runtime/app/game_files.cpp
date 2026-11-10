@@ -26,12 +26,18 @@ namespace {
 
 namespace fs = std::filesystem;
 
+fs::path g_denied;  // a folder the system would not let this executable look in (macOS privacy: Documents, Desktop)
+
 // assets beside the exe or in any folder above it (the build output)
 fs::path FindAssets() {
     auto dir = ExeDir();
     std::error_code ec;
     for (int i = 0; i < 6; i++) {
         if (fs::is_directory(dir / "assets", ec)) return dir / "assets";
+        if (g_denied.empty() && (ec == std::errc::operation_not_permitted || ec == std::errc::permission_denied)) {
+            g_denied = dir;
+            LOGE("game: not allowed to look in %s: %s", dir.string().c_str(), ec.message().c_str());
+        }
         if (!dir.has_parent_path() || dir.parent_path() == dir) break;
         dir = dir.parent_path();
     }
@@ -117,6 +123,17 @@ bool FindGame(GameFiles& game) {
     }
 
     if (other_name.empty()) {
+        if (!g_denied.empty()) {
+            std::wstring text = L"The system did not allow this program to read " + g_denied.wstring() +
+#ifdef __APPLE__
+                                L".\n\nAllow it in System Settings > Privacy & Security > Files & Folders (or Full Disk "
+                                L"Access), then start it again.";
+#else
+                                L".";
+#endif
+            MessageBoxW(nullptr, text.c_str(), kGame.short_title, MB_ICONERROR);
+            return false;
+        }
         MessageBoxW(nullptr, kGame.missing, kGame.short_title, MB_ICONERROR);
         return false;
     }
