@@ -5,6 +5,7 @@
 #include <limits>
 #include <type_traits>
 
+#include "sse_approx.h"
 #include "x86_context.h"
 
 typedef uint16_t __attribute__((aligned(1), may_alias)) x86_u16u;

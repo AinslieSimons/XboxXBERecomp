@@ -264,8 +264,8 @@ bool CodeGen::EmitSse(uint32_t va, const ZydisDecodedInstruction& in, const Zydi
         {ZYDIS_MNEMONIC_MINPS, ZYDIS_MNEMONIC_MINSS, "sse_min(a, b)"},
         {ZYDIS_MNEMONIC_MAXPS, ZYDIS_MNEMONIC_MAXSS, "sse_max(a, b)"},
         {ZYDIS_MNEMONIC_SQRTPS, ZYDIS_MNEMONIC_SQRTSS, "std::sqrt(b)"},
-        {ZYDIS_MNEMONIC_RCPPS, ZYDIS_MNEMONIC_RCPSS, "1.0f / b"},
-        {ZYDIS_MNEMONIC_RSQRTPS, ZYDIS_MNEMONIC_RSQRTSS, "1.0f / std::sqrt(b)"},
+        {ZYDIS_MNEMONIC_RCPPS, ZYDIS_MNEMONIC_RCPSS, "sse_rcp(b)"},  // the processor's approximations (cpu/sse_approx.h)
+        {ZYDIS_MNEMONIC_RSQRTPS, ZYDIS_MNEMONIC_RSQRTSS, "sse_rsqrt(b)"},
     };
     for (auto& b : bins) {
         if (m == b.ps) {
