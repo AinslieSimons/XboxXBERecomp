@@ -294,6 +294,10 @@ struct DrawAdjust {
     // 4, w unused); trace_range: the longest ray, and how far from the pixel it starts
     bool trace_reflect = false;
     float trace_from[12] = {}, trace_turn[12] = {}, trace_range[2] = {};
+    // raster_w: a W-buffered draw's depth from w at its vertices, interpolated across the screen (never nearer than the
+    // pixel's own w), in place of the pixel shader writing it: early depth tests and hidden surface removal then skip
+    // its hidden pixels (a traced car's rays among them)
+    bool raster_w = false;
 };
 using DrawFilter = void (*)(const State&, DrawAdjust&);
 inline DrawFilter g_draw_filter = nullptr;

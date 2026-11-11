@@ -58,6 +58,7 @@ struct PixelKey {
     uint32_t quad = 0;       // a screen quad: QuadHlsl
     uint32_t wbuf = 0;       // D3DZB_USEW: the depth written is the pixel's w (DrawConstants::wdepth)
     uint32_t coverage = 0;   // Settings::alpha_coverage: the target's samples, an alpha test becomes partial coverage
+    uint32_t trace_gate = 0; // kTexTraced's gate draw (MetalBackend): no ray, the pixel discarded unless its ray meets a box
     uint32_t ao = 0;         // baked occlusion (gpu/baked_ao.h, Metal): the colour before fog times it, by DrawConstants::aoc
     bool operator==(const PixelKey& o) const;
 };
@@ -152,6 +153,9 @@ struct DrawConstants {
     // barycentrics in the other order (1), the occlusion alone in place of the
     // colour (1, XBE_AO_DEBUG)
     float aoc[4];
+    // kTexTraced: up to four boxes of the draw's own (trace[7].w below 0: -trace[7].w of them), each lo.xyz hi.x then
+    // hi.yz (MetalBackend's per draw cull)
+    float tbox[8][4];
 };
 
 }  // namespace gpu

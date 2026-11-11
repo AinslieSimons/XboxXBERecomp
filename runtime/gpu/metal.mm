@@ -748,6 +748,7 @@ private:
         std::vector<id<MTLTexture>> tex;  // scene_tex_ as it was built
         std::vector<uint32_t> object;     // each draw's object (by DrawAdjust::trace_draw)
         uint32_t box_at = 0, boxes = 0;   // each object's bounds (six floats, object n at n - 1) in colours, from word box_at
+        std::vector<float> box;           // the same, for the draws' cull
     };
     TraceSlot trace_[kFramesInFlight];
     std::vector<float> scene_xyz_;         // three x y z per triangle, in the world
@@ -2329,6 +2330,7 @@ void MetalBackend::BuildScene() {
         }
         t.box_at = tris * uint32_t(kTraceWords);
         t.boxes = uint32_t(heads.size());
+        t.box = box;
         const size_t vbytes = size_t(tris) * 36, cbytes = size_t(tris) * kTraceWords * 4 + box.size() * 4;
         if (!t.verts || t.verts.length < vbytes) t.verts = [dev_ newBufferWithLength:vbytes * 3 / 2 options:MTLResourceStorageModeShared];
         if (!t.colours || t.colours.length < cbytes) t.colours = [dev_ newBufferWithLength:cbytes * 3 / 2 options:MTLResourceStorageModeShared];
@@ -2342,6 +2344,8 @@ void MetalBackend::BuildScene() {
         g.opaque = YES;
         MTLPrimitiveAccelerationStructureDescriptor* d = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
         d.geometryDescriptors = @[ g ];
+        // fast build: the scene is small (14k triangles in the demos), and fast intersection or the default traced no
+        // faster there
         d.usage = MTLAccelerationStructureUsagePreferFastBuild;
         const MTLAccelerationStructureSizes sz = [dev_ accelerationStructureSizesWithDescriptor:d];
         if (!t.as || t.as.size < sz.accelerationStructureSize) t.as = [dev_ newAccelerationStructureWithSize:sz.accelerationStructureSize * 3 / 2];
@@ -2689,6 +2693,7 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             std::memcpy(adjust.trace_turn, carried_->trace_turn, sizeof(adjust.trace_turn));
             std::memcpy(adjust.trace_range, carried_->trace_range, sizeof(adjust.trace_range));
             adjust.trace_self = carried_->trace_self;
+            adjust.raster_w = carried_->raster_w;
         }
         if (g_draw_filter && !g_draw_filtered) g_draw_filter(s, adjust);
         if (adjust.skip) return;
@@ -2733,7 +2738,36 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         const float ao_strength = ao::g_strength.load(std::memory_order_relaxed);
         const bool baked = ao::g_draw && ao_strength > 0 && !draw_2d_ && ao::Triangles();
         if (baked) pk.ao = 1;
-        const bool traced = adjust.trace_reflect && trace_live_ >= 0 && pk.programmable && pk.tex[3].kind == kTexCube && !pk.tex[3].shadow;
+        bool traced = adjust.trace_reflect && trace_live_ >= 0 && pk.programmable && pk.tex[3].kind == kTexCube && !pk.tex[3].shadow;
+        // the draw's car against the other objects' boxes grown by the ray's reach: none near, the draw is not traced;
+        // up to four, the rays test those alone (DrawConstants::tbox); more, every box. XBE_TRACE_DRAWCULL=0 (testing) off
+        static const bool drawcull = !(std::getenv("XBE_TRACE_DRAWCULL") && *std::getenv("XBE_TRACE_DRAWCULL") == '0');
+        float own_box[8][4] = {};
+        int own_boxes = -1;  // -1: the scene's boxes
+        if (traced && drawcull) {
+            const TraceSlot& t = trace_[trace_live_];
+            const uint32_t o = adjust.trace_self && adjust.trace_self <= t.object.size() ? t.object[adjust.trace_self - 1] : 0;
+            if (o && o <= t.boxes && t.box.size() >= size_t(t.boxes) * 6) {
+                const float* me = &t.box[size_t(o - 1) * 6];
+                const float reach = adjust.trace_range[0] + 1.0f;  // a metre more: the scene is the last frame's
+                own_boxes = 0;
+                for (uint32_t i = 0; i < t.boxes; i++) {
+                    if (i + 1 == o) continue;
+                    const float* b = &t.box[size_t(i) * 6];
+                    bool near = true;
+                    for (int k = 0; k < 3; k++) near &= b[k] <= me[3 + k] + reach && b[3 + k] >= me[k] - reach;
+                    if (!near) continue;
+                    if (own_boxes == 4) {
+                        own_boxes = -1;
+                        break;
+                    }
+                    float* q = own_box[own_boxes * 2];
+                    q[0] = b[0], q[1] = b[1], q[2] = b[2], q[3] = b[3], q[4] = b[4], q[5] = b[5];
+                    own_boxes++;
+                }
+                if (own_boxes == 0) traced = false;
+            }
+        }
         if (TraceLogFrame() && adjust.trace_reflect)
             LOGR("trace draw: vs %08X rt %08X %s (scene %d, self %u of %zu -> object %u, programmable %u, stage 3 kind %u) from %.4g %.4g %.4g %.4g / %.4g %.4g %.4g %.4g / %.4g %.4g %.4g %.4g",
                  s.vs_handle, s.rt.data, traced ? "traced" : "not traced", trace_live_, adjust.trace_self, trace_live_ >= 0 ? trace_[trace_live_].object.size() : 0,
@@ -2747,6 +2781,9 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             return !(e && *e == '0');
         }();
         pk.wbuf = wbuffer && s.rs[kRsZEnable] == 2 && bound_ds_ ? 1 : 0;
+        // DrawAdjust::raster_w: the vertex shader gives the W depth (hud[3] 2), the pixel shader writes none
+        const bool raster_w = pk.wbuf && adjust.raster_w;
+        if (raster_w) pk.wbuf = 0;
         // alpha tested, not blended, onto twins: Settings::alpha_coverage (not quads, whose shader is rewritten)
         if (app::Get().alpha_coverage && bound_ms_ && !sh.quad && SimpleState(s, kMAlphaTestEnable) && !SimpleState(s, kMBlendEnable)) pk.coverage = msaa_;
         sh.pkey = Hash(&pk, sizeof(pk));
@@ -2761,9 +2798,37 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         k.zbias += adjust.depth_bias;
         // W-buffered: the pixel shader adds the polygon offset to w (d3d12.cpp Draw)
         float wdepth[4] = {float(k.zbias) * s.zscale / kDepth24Max, k.zslope, 1.0f / (s.zscale + 1.0f), sh.prog ? 1.0f : s.zscale * s.inv_wfar};
-        if (pk.wbuf) k.zbias = 0, k.zslope = 0;
+        if (pk.wbuf || raster_w) k.zbias = 0, k.zslope = 0;
         Pipeline* p = EnsurePipeline(k, a, sh);
         if (!p->state) return;
+        // a traced draw with its depth from the vertices (DrawAdjust::raster_w), opaque and using no stencil, is drawn
+        // three times: with the cube alone (no ray code), then a gate draw writing no colour that sets stencil bit 7
+        // where the pixel's ray meets a box, then the traced shader where depth is equal and the bit set (clearing it).
+        // Only pixels whose ray can hit a car run a shader with ray code in it: any intersect in a fragment shader cost
+        // about 1 ms a frame even unreached. XBE_TRACE_GATE=0 (testing) off
+        static const bool gate_on = !(std::getenv("XBE_TRACE_GATE") && *std::getenv("XBE_TRACE_GATE") == '0');
+        Pipeline *p_cube = nullptr, *p_gate = nullptr;
+        if (gate_on && traced && raster_w && bound_ds_ && !k.sten && !k.blend && k.zen && k.zwrite && !s.simple[kMCountEnable >> 2]) {
+            PixelKey pk_cube = pk;
+            pk_cube.tex[3].flags &= uint8_t(~kTexTraced);
+            DrawShaders sh_cube = sh;
+            sh_cube.pkey = Hash(&pk_cube, sizeof(pk_cube));
+            EnsurePixelShader(pk_cube, sh_cube);
+            PixelKey pk_gate = pk;
+            pk_gate.trace_gate = 1;
+            DrawShaders sh_gate = sh;
+            sh_gate.pkey = Hash(&pk_gate, sizeof(pk_gate));
+            EnsurePixelShader(pk_gate, sh_gate);
+            if (sh_cube.ps_code && sh_gate.ps_code) {
+                PsoKey kc = k, kg = k;
+                kc.ps = sh_cube.ph;
+                kg.ps = sh_gate.ph, kg.wmask = 0;
+                p_cube = EnsurePipeline(kc, a, sh_cube);
+                p_gate = EnsurePipeline(kg, a, sh_gate);
+                if (!p_cube->state || !p_gate->state) p_cube = p_gate = nullptr;
+            }
+            LOGR_FIRST(1, "metal: traced draws gated: the ray's shader only where a ray meets a box");
+        }
 
         lap.Mark(perf::kStPipeline);
         draw_counting_ = s.simple[kMCountEnable >> 2] != 0;
@@ -2806,7 +2871,7 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         float stretch = bound_rt_ ? XStretch(aspect_, guest_h_, bound_rt_->gw, bound_rt_->gh) : 0;
         c.hud[0] = HudSqueeze(s, a, aspect_, stretch);
         c.hud[2] = DepthTested(s) ? 1.0f : 0.0f;
-        c.hud[3] = pk.wbuf ? 1.0f : 0.0f;
+        c.hud[3] = pk.wbuf ? 1.0f : raster_w ? 2.0f : 0.0f;
         if (bound_rt_) NoteSqueeze(s, a, bound_rt_->data, bound_rt_->gw, bound_rt_->gh, bound_rt_->w, aspect_, stretch, c.hud[0]);
         c.hud[1] = (bound_rt_ ? bound_rt_->gw : guest_w_) * 0.5f / s.aa_x;
         if (c.hud[0] != 1 && !s.squeeze_beyond) {
@@ -2842,6 +2907,10 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             c.trace[7][1] = adjust.trace_self && adjust.trace_self <= object.size() ? float(object[adjust.trace_self - 1]) : 0.0f;
             static const bool nobox = std::getenv("XBE_TRACE_NOBOX") != nullptr;  // testing: every ray into the scene
             c.trace[7][2] = float(trace_[trace_live_].box_at), c.trace[7][3] = nobox ? 0.0f : float(trace_[trace_live_].boxes);
+            if (!nobox && own_boxes > 0) {
+                c.trace[7][3] = -float(own_boxes);
+                std::memcpy(c.tbox, own_box, sizeof(own_box));
+            }
         }
         lap.Mark(perf::kStEncoderState);
         UploadConstants(s, sh, k, stages, size, c);
@@ -2919,7 +2988,36 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             counted_.push_back({slot, 0, SamplesPerPixel()});
         }
         lap.Mark(perf::kStTextureSet);
-        DrawGeometry(a, *p);
+        if (p_cube && p_gate) {
+            static id<MTLDepthStencilState> mark, traced_state;
+            if (!mark) {
+                MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+                dd.depthCompareFunction = MTLCompareFunctionEqual;
+                dd.depthWriteEnabled = NO;
+                MTLStencilDescriptor* sd = [MTLStencilDescriptor new];
+                sd.stencilCompareFunction = MTLCompareFunctionAlways;
+                sd.depthStencilPassOperation = MTLStencilOperationReplace;
+                sd.readMask = 0x80, sd.writeMask = 0x80;
+                dd.frontFaceStencil = dd.backFaceStencil = sd;
+                mark = [dev_ newDepthStencilStateWithDescriptor:dd];
+                sd.stencilCompareFunction = MTLCompareFunctionEqual;
+                sd.depthStencilPassOperation = MTLStencilOperationZero;
+                dd.frontFaceStencil = dd.backFaceStencil = sd;
+                traced_state = [dev_ newDepthStencilStateWithDescriptor:dd];
+            }
+            [enc_ setRenderPipelineState:p_cube->state];
+            DrawGeometry(a, *p_cube);
+            [enc_ setRenderPipelineState:p_gate->state];
+            [enc_ setDepthStencilState:mark];
+            [enc_ setStencilReferenceValue:0x80];
+            DrawGeometry(a, *p_gate);
+            [enc_ setRenderPipelineState:p->state];
+            [enc_ setDepthStencilState:traced_state];
+            DrawGeometry(a, *p);
+            enc_pipeline_ = p->state, enc_depth_state_ = traced_state;
+        } else {
+            DrawGeometry(a, *p);
+        }
         lap.Mark(perf::kStGeometry);
         if (counting) [enc_ setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
     }

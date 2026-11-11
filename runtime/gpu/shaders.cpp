@@ -68,6 +68,7 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 zclip;  // the depth clip planes
     float4 trace[8];  // kTexTraced
     float4 aoc;  // PixelKey::ao
+    float4 tbox[8];  // kTexTraced: the draw's own boxes
 };
 )";
 
@@ -250,6 +251,8 @@ const char* kVsEpilogue = R"(
     q.w = p.w;
     o.pos = q;
     o.clipz = float2(q.z - zclip.x * q.w, zclip.y * q.w - q.z);
+    // DrawAdjust::raster_w: the W depth at the vertex, the polygon offset's constant part in (as the pixel shader's)
+    if (hud.w == 2) o.pos.z = saturate((q.w * wdepth.w + wdepth.x) * wdepth.z) * q.w;
     o.d0 = saturate(oD0);
     o.d1 = saturate(oD1);
     o.b0 = saturate(oB0);
@@ -596,16 +599,24 @@ float4 traced(raytracing::primitive_acceleration_structure as, const device uint
     // the other cars' bounds first (trace[7].w of them, from word trace[7].z): a ray that meets none is the cube's (most
     // rays: sky, road, buildings), and one that does looks only between the first box it enters and the last it leaves,
     // past its own car, whose dense triangles about its start made every ray slow
-    uint nb = min(uint(trace[7].w), 64u);
+    // trace[7].w below 0: the draw's own boxes, -trace[7].w of them in tbox, its own object's left out already
+    bool own = trace[7].w < 0;
+    uint nb = own ? uint(-trace[7].w) : min(uint(trace[7].w), 64u);
     if (nb > 0 && trace[3].w == 0) {
         uint at = uint(trace[7].z);
         float3 inv = 1.0 / d;
         float enter = trace[3].y, leave = 0;
         for (uint i = 0; i < nb; i++) {
-            if (i + 1 == self) continue;
-            const device uint* bx = tri + at + i * 6;
-            float3 lo = float3(as_type<float>(bx[0]), as_type<float>(bx[1]), as_type<float>(bx[2]));
-            float3 hi = float3(as_type<float>(bx[3]), as_type<float>(bx[4]), as_type<float>(bx[5]));
+            float3 lo, hi;
+            if (own) {
+                lo = tbox[i * 2].xyz;
+                hi = float3(tbox[i * 2].w, tbox[i * 2 + 1].xy);
+            } else {
+                if (i + 1 == self) continue;
+                const device uint* bx = tri + at + i * 6;
+                lo = float3(as_type<float>(bx[0]), as_type<float>(bx[1]), as_type<float>(bx[2]));
+                hi = float3(as_type<float>(bx[3]), as_type<float>(bx[4]), as_type<float>(bx[5]));
+            }
             float3 t0 = (lo - r.origin) * inv, t1 = (hi - r.origin) * inv;
             float3 a3 = min(t0, t1), b3 = max(t0, t1);
             float a = max(max(a3.x, a3.y), max(a3.z, 0.0)), b = min(min(b3.x, b3.y), min(b3.z, r.max_distance));
@@ -654,6 +665,50 @@ float4 traced(raytracing::primitive_acceleration_structure as, const device uint
     if (trace[3].w == 3) return float4(c, env.a);
     float fade = saturate((trace[3].y - dist) / (0.3 * trace[3].y));
     return float4(mix(env.rgb, c, fade), env.a);
+}
+)";
+
+// kTexTraced's gate draw (PixelKey::trace_gate): the ray as traced() makes it, tested against the boxes alone, the
+// pixel discarded unless it meets one; the draw after it traces only the pixels this one marked (a stencil bit)
+const char* kPsTracedGate = R"(
+float4 traced(raytracing::primitive_acceleration_structure as, const device uint* tri, array<texture2d<float>, 16> stex, TexCube cube, sampler sm, float3 dir, float2 px, float w) {
+    float3 u = float3(px * w, w);
+    float3 o = float3(dot(trace[0].xyz, u) + trace[0].w, dot(trace[1].xyz, u) + trace[1].w, dot(trace[2].xyz, u) + trace[2].w);
+    float3 d = float3(dot(trace[4].xyz, dir), dot(trace[5].xyz, dir), dot(trace[6].xyz, dir));
+    float len = length(d);
+    float3 n = cross(dfdx(o), dfdy(o));
+    float3 eye = float3(trace[0].w, trace[1].w, trace[2].w) - o;
+    if (dot(n, eye) < 0) n = -n;
+    if (trace[3].x == 0 || !(len > 1e-6)) discard_fragment();
+    d /= len;
+    if (dot(n, d) <= 0) discard_fragment();
+    uint self = uint(trace[7].y);
+    bool own = trace[7].w < 0;
+    uint nb = own ? uint(-trace[7].w) : min(uint(trace[7].w), 64u);
+    if (nb > 0) {
+        float3 org = o + d * trace[3].z;
+        uint at = uint(trace[7].z);
+        float3 inv = 1.0 / d;
+        float leave = 0;
+        for (uint i = 0; i < nb; i++) {
+            float3 lo, hi;
+            if (own) {
+                lo = tbox[i * 2].xyz;
+                hi = float3(tbox[i * 2].w, tbox[i * 2 + 1].xy);
+            } else {
+                if (i + 1 == self) continue;
+                const device uint* bx = tri + at + i * 6;
+                lo = float3(as_type<float>(bx[0]), as_type<float>(bx[1]), as_type<float>(bx[2]));
+                hi = float3(as_type<float>(bx[3]), as_type<float>(bx[4]), as_type<float>(bx[5]));
+            }
+            float3 t0 = (lo - org) * inv, t1 = (hi - org) * inv;
+            float3 a3 = min(t0, t1), b3 = max(t0, t1);
+            float a = max(max(a3.x, a3.y), max(a3.z, 0.0)), b = min(min(b3.x, b3.y), min(b3.z, trace[3].y));
+            if (a <= b) leave = max(leave, b);
+        }
+        if (leave <= 0) discard_fragment();
+    }
+    return float4(0, 0, 0, 1);
 }
 )";
 
@@ -1049,6 +1104,7 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
     if (hud.w != 0) cp.z = min(cp.z, cp.w);  // W-buffered: nothing clipped past the far plane (the programs' epilogue)
     o.pos = cp;
     o.clipz = float2(cp.z - zclip.x * cp.w, zclip.y * cp.w - cp.z);
+    if (hud.w == 2) o.pos.z = saturate((cp.w * wdepth.w + wdepth.x) * wdepth.z) * cp.w;  // DrawAdjust::raster_w
     o.d0 = saturate(oD0);
     o.d1 = saturate(oD1);
     o.b0 = o.d0;
@@ -1077,7 +1133,7 @@ std::string PixelHlsl(const PixelKey& k) {
     for (int i = 0; i < 4; i++)
         if (k.tex[i].flags & kTexTraced) {
             s += "TexTrace scene : register(t8);\n";
-            s += kPsTraced;
+            s += k.trace_gate ? kPsTracedGate : kPsTraced;
             break;
         }
     if (k.ao) s += std::string("TexAo bakedao : register(t9);\n") + kPsBakedAo;
