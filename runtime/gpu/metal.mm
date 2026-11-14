@@ -688,6 +688,7 @@ private:
     Alloc const_at_;
     uint8_t const_last_[sizeof(State::vsc) + sizeof(DrawConstants)] = {};  // what const_at_ holds
     bool const_whole_ = false;  // const_last_ has the fixed function constants
+    uint64_t vsc_count_ = 0;    // State::vsc_gen of the vertex constants const_last_ holds (0: not counted)
     bool const_bound_ = false;
     // set in the open encoder
     id<MTLRenderPipelineState> enc_pipeline_;
@@ -2608,10 +2609,12 @@ void MetalBackend::UploadConstants(const State& s, const DrawShaders& sh, const 
     uint8_t* last_dc = const_last_ + kVc;
     const bool whole = sh.fixed_transform;
     const size_t head = whole ? kDc : kHole, tail = whole ? 0 : kDc - kHoleEnd;
-    const bool vc_same = !std::memcmp(const_last_, vsc, kVc);
+    // the render thread counts the vertex constants' changes (State::vsc_gen): the same count is the same constants, so no compare
+    const bool vc_same = (s.vsc_gen && s.vsc_gen == vsc_count_) || !std::memcmp(const_last_, vsc, kVc);
+    vsc_count_ = vc_same ? s.vsc_gen : 0;
     const bool dc_same = const_whole_ == whole && !std::memcmp(last_dc, dc, head) && !std::memcmp(last_dc + kHoleEnd, dc + kHoleEnd, tail);
     if (!(vc_same && dc_same && const_at_.p && const_at_.buf == ring_)) {
-        if (!vc_same) std::memcpy(const_last_, vsc, kVc);
+        if (!vc_same) std::memcpy(const_last_, vsc, kVc), vsc_count_ = s.vsc_gen;
         if (!dc_same) {
             std::memcpy(last_dc, dc, head);
             std::memcpy(last_dc + kHoleEnd, dc + kHoleEnd, tail);
