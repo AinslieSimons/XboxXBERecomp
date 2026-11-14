@@ -167,7 +167,7 @@ void FillNetworkInfo(uint32_t out, const Disc::Entry& e) {
     FillNetworkInfo(out, MountedDisc()->Time(), e.dir ? 0 : e.size, e.dir);
 }
 
-bool WildMatch(const std::string& pat, const std::string& s) {
+bool WildMatchPlain(const std::string& pat, const std::string& s) {
     size_t p = 0, i = 0, star = std::string::npos, mark = 0;
     while (i < s.size()) {
         if (p < pat.size() && (pat[p] == '?' || std::toupper(uint8_t(pat[p])) == std::toupper(uint8_t(s[i])))) {
@@ -185,6 +185,15 @@ bool WildMatch(const std::string& pat, const std::string& s) {
     }
     while (p < pat.size() && pat[p] == '*') p++;
     return p == pat.size();
+}
+
+// as the console's (DOS's) rule has it, a pattern ending in ".*" also matches a name with no dot: "*.*" is every name,
+// and 50 Cent: Bulletproof finds its profile file "~P5628E0D4" in a save's folder by "~*.*" (not found, every save
+// was listed as damaged)
+bool WildMatch(const std::string& pat, const std::string& s) {
+    if (WildMatchPlain(pat, s)) return true;
+    return pat.size() >= 2 && pat.compare(pat.size() - 2, 2, ".*") == 0 && s.find('.') == std::string::npos &&
+           WildMatchPlain(pat.substr(0, pat.size() - 2), s);
 }
 
 // past 2 GB a long offset wraps on Windows
@@ -366,6 +375,7 @@ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t hand
     f->xbox = Normalize(name);
     f->entry = e;
     f->dir = e->dir;
+    f->cdrom = true;  // its volume is the DVD's (QueryVolume): EoN took one for a hard disk and looked for loose files
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, 1);
     FILE_LOG(400, "open %s", name.c_str());
@@ -630,6 +640,21 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
         size_t done = f->entry ? MountedDisc()->Read(*f->entry, pos + n, HostPtr(at), chunk)
                       : write  ? std::fwrite(HostPtr(at), 1, chunk, f->fp)
                                : std::fread(HostPtr(at), 1, chunk, f->fp);
+        // a host read error is not the file's end (a network share's moment): asked again a few times, then logged;
+        // the title took a short read as data (Agent Under Fire's first map load ran from a share: a null map pointer)
+        for (int retry = 0; !write && f->fp && done < chunk && std::ferror(f->fp) && retry < 5; retry++) {
+            std::clearerr(f->fp);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            Seek(f->fp, pos + n + done);
+            done += std::fread(HostPtr(at + uint32_t(done)), 1, chunk - done, f->fp);
+            LOGR("files: %s: a read at %llu failed on the host, asked again (%zu of %u bytes now)", f->xbox.c_str(),
+                 (unsigned long long)(pos + n), done, chunk);
+        }
+        if (!write && f->fp && done < chunk && std::ferror(f->fp)) {
+            LOGE("files: %s: a read at %llu still fails on the host: the title gets %zu of %u bytes", f->xbox.c_str(),
+                 (unsigned long long)(pos + n), done, chunk);
+            std::clearerr(f->fp);
+        }
         n += uint32_t(done);
         if (done < chunk) break;
     }

@@ -654,8 +654,8 @@ Target* D3D11Backend::EnsureTarget(const Surface& s, bool depth, uint32_t gw, ui
     }
     t.data = data;
     TextureDesc d;
-    t.linear32 = depth || (Describe(s.header, d) && d.linear && Format(d.format).bits == 32);
-    t.swizzled32 = !depth && !t.linear32 && Describe(s.header, d) && Format(d.format).swizzled &&
+    t.linear32 = depth || (DescribeSurface(s, d) && d.linear && Format(d.format).bits == 32);
+    t.swizzled32 = !depth && !t.linear32 && DescribeSurface(s, d) && Format(d.format).swizzled &&
                    !Format(d.format).compressed && Format(d.format).bits == 32;
     t.bytes = depth ? sw * sh * 4 : GuestPitch(sw) * sh;
     t.epoch = DirtyEpoch(data);
@@ -728,7 +728,7 @@ bool D3D11Backend::BindTargets(const State& s) {
 // CPU pixels of a colour surface into its target, scaled
 void D3D11Backend::UploadTarget(Target& t, const Surface& s) {
     TextureDesc d;
-    if (!Describe(s.header, d) || Format(d.format).depth) return;
+    if (!DescribeSurface(s, d) || Format(d.format).depth) return;
     std::vector<uint8_t> px;
     uint32_t pitch;
     // after a Sync only the pixels the CPU changed go over the picture, which stays at render scale
@@ -1922,7 +1922,7 @@ void D3D11Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         if (span == kSpanViewport) c.hud[0] = 1;      // a pass filling its own viewport
     }
     SqueezeBeyond(s, c.hud);
-    Pillarbox(s, a, aspect_, stretch, c.hud);
+    Pillarbox(s, a, aspect_, stretch, c.hud, c.zclip + 2, float(bound_rt_ ? bound_rt_->gh : guest_h_) / s.aa_y);
     UploadConstants(s, sh, k, stages, size, c);
     SetTexturesAndSamplers(s, a, stages);
     SetViewportScissor(s, size.w, c);
@@ -2143,7 +2143,15 @@ void D3D11Backend::Present(const Surface& front) {
     RenderUi();
     bool vsync = app::Get().vsync;
     if (vsync && tearing_ && PresentUnsynced()) vsync = false;
-    swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    if (FAILED(swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0))) {
+        // a lost device draws nothing more: the last picture stays up
+        static bool told = false;
+        if (!told && FAILED(dev_->GetDeviceRemovedReason())) {
+            told = true;
+            LOGR("d3d11: the GPU device was lost: reason %08X (present %llu)", unsigned(dev_->GetDeviceRemovedReason()),
+                 (unsigned long long)presents_);
+        }
+    }
     if (latency_wait_) WaitForSingleObjectEx(latency_wait_, 1000, FALSE);
     // the flip model unbinds the back buffer
     Unbind();

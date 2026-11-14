@@ -8,6 +8,10 @@
 // this to D3D12; nothing here models the console's GPU.
 namespace gpu {
 
+// ultrawide 2D: guest pixels from the frame's left or right edge that a vertex may be and still count as on it
+// (DrawSpan, the shaders' 1.5, the reference renderer)
+constexpr float kEdgeNear = 1.5f;
+
 // D3DRS indices of the XDK 5849 build this title links, taken from its own tables
 enum : uint32_t {
     kRsDeferredFirst = 92,
@@ -161,6 +165,13 @@ struct Viewport {
 struct Surface {
     uint32_t header = 0;  // guest D3DSurface
     uint32_t data = 0, format = 0, size = 0;
+    // format and size describe it rather than its header: an in-between frame's replay of a draw, with the size its target had
+    // when drawn (a title may describe another size in the same header later in the step)
+    bool as_drawn = false;
+    // a front buffer only: a title showing its frames blended (SetFrameBlend; Direct3D 12): how much of this image
+    // over the last one, and whether the image is a new one
+    float blend = 1;
+    bool blend_new = false;
 };
 
 // a v register's value before a title sets one: colours 1, the rest 0 0 0 1
@@ -200,6 +211,9 @@ struct State {
     std::shared_ptr<VertexShader> vs;
     std::shared_ptr<PixelShader> ps;
     std::array<std::array<float, 4>, 192> vsc{};  // hardware order: D3D register + 96
+    // the render thread's count of vsc's changes, 0 when not counted (no render thread): a backend compares vsc then.
+    // The render thread sets it after applying each state change (the title's own copy stays 0)
+    uint64_t vsc_gen = 0;
     std::array<std::array<float, 4>, 16> psc{};
     Viewport viewport;
     Surface rt, zs;
@@ -234,6 +248,9 @@ struct State {
     // space draws are squeezed into the centred part of it (gpu::HudSqueeze; PGR2's title 2D, laid out 4:3, over a 16:9
     // attract demo)
     float hud_aspect = 0;
+    // set with pillar_aspect: such a picture is enlarged about the centre until it fills the frame's width (its top and
+    // bottom cropped) instead of pillarboxed: not stretched, and nothing left uncovered at the sides
+    bool pillar_fill = false;
     // ultrawide: the 2D being drawn is drawn past the frame's edge by a game hook to fill a margin of the squeezed picture:
     // clipped to that margin instead of the squeezed viewport (-1 left, 1 right, 0 no)
     int squeeze_margin = 0;

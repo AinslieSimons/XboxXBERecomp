@@ -87,7 +87,8 @@ int mac_arl(float v) { return (int)floor(v + 1e-3); }
 float magclamp(float v) { float m = clamp(abs(v), 5.42101e-20, 1.84467e+19); return v < 0 ? -m : m; }
 float4 ilu_rcp(float v) { return (1.0 / v).xxxx; }
 float4 ilu_rcc(float v) { return magclamp(1.0 / v).xxxx; }
-float4 ilu_rsq(float v) { return v == 0 ? (1.#INF).xxxx : (rsqrt(abs(v))).xxxx; }
+// the largest float for infinity: Wine's HLSL compiler (vkd3d) has no 1.#INF, and stops at it
+float4 ilu_rsq(float v) { return v == 0 ? (3.402823e38).xxxx : (rsqrt(abs(v))).xxxx; }
 // 2^floor(v), fraction, 2^v
 float4 ilu_exp(float v) {
     float whole = floor(v);
@@ -96,7 +97,7 @@ float4 ilu_exp(float v) {
 // exponent, mantissa, log2 of |v|; zero logs to negative infinity
 float4 ilu_log(float v) {
     float mag = abs(v), l2 = log2(mag), ex = floor(l2);
-    return mag == 0 ? float4(-1.#INF, 1, -1.#INF, 1) : float4(ex, mag / exp2(ex), l2, 1);
+    return mag == 0 ? float4(-3.402823e38, 1, -3.402823e38, 1) : float4(ex, mag / exp2(ex), l2, 1);
 }
 // power clamped to 128 less 1/256
 float4 ilu_lit(float4 s) {
@@ -898,7 +899,7 @@ std::string VertexProgramHlsl(const std::vector<uint32_t>& prog, uint16_t regs, 
     // ultrawide: 2D squeezed as pretransformed draws are (FixedVertexHlsl), at the near plane by its w (4 or less);
     // a matrix program's only when the draw's matrix is 2D (hud.x 1 otherwise: gpu::ScreenDraw)
     if (app::kGame.squeeze_screen_programs && (ScreenProgram(prog) || MatrixProgram(prog) >= 0))
-        s += "    if ((hud.x < 0 || (oPos.x > 0.5 && oPos.x < hud.y * 2 - 0.5)) && (hud.z == 0 || oPos.w <= 4))\n"
+        s += "    if ((hud.x < 0 || (oPos.x > 1.5 && oPos.x < hud.y * 2 - 1.5)) && (hud.z == 0 || oPos.w <= 4))\n"
              "        oPos.x = hud.y + (oPos.x - hud.y) * abs(hud.x);\n";
     s += kVsEpilogue;
     return s;
@@ -944,13 +945,16 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
         s += "    float4 rhw = " + v(0, "float4(0,0,0,1)") + ";\n";
         s += "    float w = rhw.w == 0 ? 1 : 1 / rhw.w;\n";
         s += "    oPos = float4(rhw.xy, rhw.z / surf.z, w);\n";
-        // ultrawide: 2D drawn in a centred 16:9 part; a corner on the frame's left or right edge stays there (HUD bars
-        // reaching the edge keep reaching it, full screen passes and full width lines keep their width)
+        // ultrawide: 2D drawn in a centred 16:9 part; a corner on the frame's left or right edge, or within a pixel and a
+        // half of it (gpu::kEdgeNear), stays there (HUD bars reaching the edge keep reaching it, full screen passes and
+        // full width lines keep their width)
         // a depth tested draw (hud.z) only at the near plane: 2D drawn with depth on, not a glow out in the world
         // hud.x negative: no corner kept on an edge (a draw not spanning the frame, gpu::DrawSpan: EoN's driving radar;
         // State::squeeze_beyond)
-        s += "    if ((hud.x < 0 || (oPos.x > 0.5 && oPos.x < hud.y * 2 - 0.5)) && (hud.z == 0 || rhw.w >= 0.25))\n"
+        s += "    if ((hud.x < 0 || (oPos.x > 1.5 && oPos.x < hud.y * 2 - 1.5)) && (hud.z == 0 || rhw.w >= 0.25))\n"
              "        oPos.x = hud.y + (oPos.x - hud.y) * abs(hud.x);\n";
+        // State::pillar_fill: the picture enlarged about the centre to its own shape (zclip.z the scale, .w the centre)
+        s += "    if (zclip.z > 0) oPos.y = zclip.w + (oPos.y - zclip.w) * zclip.z;\n";
     } else {
         s += "    float4 ip = float4(" + v(0, "float4(0,0,0,1)") + ".xyz, 1);\n";
         s += "    float4 cp = mul(ip, wvp);\n";

@@ -43,9 +43,36 @@ bool g_mode_changed = false;
 bool g_apply_posted = false;  // a display apply is waiting in the queue or running
 std::atomic<bool> g_active{true};  // the game window is in front (WM_ACTIVATE)
 
-// crash dump in CrashDumps beside the exe
+// the guest's committed memory added to a crash dump at its host address (guest address + kernel::g_base), one run of
+// committed pages (at most 16 MB) for each MemoryCallback, up to 512 MB in all: a dump shows the title's own state
+struct DumpGuestRuns {
+    uint64_t va = 0x1000;
+    uint64_t total = 0;
+};
+BOOL CALLBACK DumpCallback(PVOID param, const PMINIDUMP_CALLBACK_INPUT in, PMINIDUMP_CALLBACK_OUTPUT out) {
+    if (!in || !out || in->CallbackType != MemoryCallback) return TRUE;
+    auto& r = *static_cast<DumpGuestRuns*>(param);
+    out->MemoryBase = 0;
+    out->MemorySize = 0;
+    while (r.va < 0x100000000ull && r.total < (512ull << 20)) {
+        if (!mem::IsCommitted(uint32_t(r.va))) {
+            r.va += 0x1000;
+            continue;
+        }
+        uint64_t end = r.va;
+        while (end < 0x100000000ull && end - r.va < 0x1000000 && mem::IsCommitted(uint32_t(end))) end += 0x1000;
+        out->MemoryBase = reinterpret_cast<ULONG64>(kernel::HostPtr(uint32_t(r.va)));
+        out->MemorySize = ULONG(end - r.va);
+        r.total += end - r.va;
+        r.va = end;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+// crash dump in CrashDumps beside the exe, with the guest's memory (DumpCallback); the guest registers and return
+// addresses go to the log
 LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
-    // the dump holds no guest memory: the guest registers and return addresses go to the log
     if (kernel::Thread* t = kernel::Current(); e && t && t->ctx) {
         auto* r = e->ExceptionRecord;
         LOGE("exception %08lX at %p on guest thread %X", r->ExceptionCode, r->ExceptionAddress, t->id);
@@ -66,11 +93,15 @@ LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* e) {
     HANDLE f = CreateFileW((dir / name).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return EXCEPTION_CONTINUE_SEARCH;
     MINIDUMP_EXCEPTION_INFORMATION info{GetCurrentThreadId(), e, FALSE};
+    DumpGuestRuns runs;
+    MINIDUMP_CALLBACK_INFORMATION callback{DumpCallback, &runs};
     MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f,
                       MINIDUMP_TYPE(MiniDumpWithDataSegs | MiniDumpWithHandleData | MiniDumpWithThreadInfo |
                                     MiniDumpWithUnloadedModules | MiniDumpWithIndirectlyReferencedMemory),
-                      e ? &info : nullptr, nullptr, nullptr);
+                      e ? &info : nullptr, nullptr, &callback);
     CloseHandle(f);
+    LOGE("crash dump %ls written, with %llu MB of guest memory (guest address + %p)", name,
+         (unsigned long long)(runs.total >> 20), static_cast<void*>(kernel::g_base));
     logx::Flush();
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -220,6 +251,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         std::lock_guard lock(UiLock());
         if (OverlayKey(vk)) return 0;
     }
+    // Alt+Enter: a window against the full screen mode last used (borderless when the game started in a window), saved
+    // as F1's display mode is, and applied now; DXGI's own Alt+Enter is off (MakeWindowAssociation)
+    if (msg == WM_SYSKEYDOWN && wp == VK_RETURN && (lp & (1 << 29))) {
+        if (!(lp & (1 << 30))) {
+            static DisplayMode full = DisplayMode::Borderless;
+            {
+                std::lock_guard lock(UiLock());
+                Settings& s = Get();
+                if (s.display_mode != DisplayMode::Windowed) full = s.display_mode;
+                s.display_mode = s.display_mode == DisplayMode::Windowed ? full : DisplayMode::Windowed;
+                Save();
+            }
+            LOGR("Alt+Enter: %s", Get().display_mode == DisplayMode::Windowed  ? "window"
+                                  : Get().display_mode == DisplayMode::Borderless ? "borderless window"
+                                                                                  : "full screen");
+            ApplyNow();
+        }
+        return 0;
+    }
+    if (msg == WM_SYSCHAR && wp == '\r') return 0;  // no beep for Alt+Enter
     // the settings window: F1 opens and closes it, and a key binding it waits for takes the next key
     if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
         std::lock_guard lock(UiLock());
@@ -237,6 +288,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_KEYDOWN:
             if (wp == VK_F3) DumpThreads();
+            if (wp == VK_F8 && !diag::g_f8_pressed) {
+                LOGR("F8: experiments set to start now begin");
+                diag::g_f8_pressed = true;
+            }
             if (wp == VK_F12 && !(lp & (1 << 30))) RequestScreenshot();
             if (wp == VK_F4) {
                 LOGR("F4: frame log requested");
@@ -277,9 +332,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetForegroundWindow(hwnd);
             return 0;
         case WM_CLOSE:
+            // who closes it (a relaunched instance once ended at once, before its handover, with no quit asked for)
+            LOGR("window: WM_CLOSE (%s, %s)", InSendMessage() ? "sent from another thread or process" : "posted or sent here",
+                 app::HandingOver() ? "while handing over" : "after the handover");
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
+            LOGR("window: WM_DESTROY");
             PostQuitMessage(0);
             return 0;
     }
@@ -366,6 +425,14 @@ void Pace(uint32_t vblanks) {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     SetUnhandledExceptionFilter(app::WriteCrashDump);
     std::signal(SIGABRT, [](int) { app::WriteCrashDump(nullptr); });
+    // the C runtime's invalid parameter (a bad printf argument, a closed handle...) ends the process at once, without
+    // the filter above: logged and dumped first
+    _set_invalid_parameter_handler([](const wchar_t* expr, const wchar_t* fn, const wchar_t* file, unsigned line, uintptr_t) {
+        LOGE("the C runtime's invalid parameter handler: %ls in %ls (%ls:%u)", expr ? expr : L"?", fn ? fn : L"?",
+             file ? file : L"?", line);
+        app::WriteCrashDump(nullptr);
+        std::_Exit(3);
+    });
     timeBeginPeriod(1);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     // one log a session: a relaunch into another image carries on its predecessor's
@@ -428,12 +495,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     }
 
     MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    BOOL got;
+    while ((got = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
     if (app::g_mode_changed) ChangeDisplaySettingsW(nullptr, 0);
-    LOGR("the window closed");
+    // why the loop ended: WM_QUIT (got 0, its code) or an error (got -1); and whether the window was destroyed
+    LOGR("the window closed (GetMessage %d, quit code %llu, error %lu, window %s, %s)", int(got),
+         (unsigned long long)msg.wParam, got < 0 ? GetLastError() : 0ul, IsWindow(app::g_hwnd) ? "still there" : "destroyed",
+         app::HandingOver() ? "before its handover" : "after its handover");
     logx::Flush();
     kernel::Shutdown(0);
 }

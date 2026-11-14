@@ -181,6 +181,8 @@ int32_t g_program_slot = -1;
 bool g_program_written = false;
 std::unordered_map<uint32_t, std::shared_ptr<gpu::PixelShader>> g_ps;
 std::array<uint32_t, 3> g_buffers{};  // front, back surfaces
+std::atomic<float> g_frame_blend{1};  // SetFrameBlend, for the next Present
+std::atomic<bool> g_frame_blend_new{false};
 uint32_t g_buffer_count = 2;
 uint32_t g_depth = 0;
 // Swap with the copy flags and not FINISH starts the title's own copy of the back buffer to the front buffer (a title
@@ -294,7 +296,7 @@ void SyncDeferred() {
     // (NightFire's scope colours 16384 points from a 128x128 swizzled target a pass before drew)
     if (g_backend)
         for (const auto& st : g_state.streams)
-            if (st.vb) g_backend->Sync(mem::VirtualFromPhysical(R32(st.vb + 4)), 0);
+            if (st.vb) g_backend->SyncVertices(mem::VirtualFromPhysical(R32(st.vb + 4)));
 }
 
 float ZScale(const gpu::Surface& zs) {
@@ -343,6 +345,14 @@ void UpdateSampleScale() {
     else if (mode == 1) (made_y == 2 && made_x == 1 ? y : x) = 2;
     g_state.aa_x = std::max<uint32_t>(x / made_x, 1);
     g_state.aa_y = std::max<uint32_t>(y / made_y, 1);
+    // XBE_NO_SAMPLE_SCALE=1 (experiment): the modes are not applied, every draw lands 1x1
+    static const bool off = [] {
+        const char* e = std::getenv("XBE_NO_SAMPLE_SCALE");
+        bool v = e && *e == '1';
+        if (v) LOGR("d3d: XBE_NO_SAMPLE_SCALE=1, the multisample modes are not applied");
+        return v;
+    }();
+    if (off) g_state.aa_x = g_state.aa_y = 1;
     // each target the back buffer's mode is asked on, once: applied (the back buffer) or not (another target)
     uint32_t asked = g_state.rs[gpu::kRsMultiSampleMode];
     if (asked && g_state.rt.header) {
@@ -426,6 +436,11 @@ void VerticalBlank(X86Context& ctx) {
 }
 
 }  // namespace
+
+void SetFrameBlend(float weight, bool new_image) {
+    g_frame_blend = weight;
+    if (new_image) g_frame_blend_new = true;
+}
 
 gpu::State& State() { return g_state; }
 std::recursive_mutex& Lock() { return g_lock; }
@@ -945,6 +960,17 @@ uint32_t PresentVblanks() {
 namespace {
 uint32_t SwapFrame(X86Context& ctx, uint32_t swap_flags) {
     constexpr uint32_t kCopy = 1, kBypassCopy = 2, kFinish = 4;
+    // XBE_TEST_CRASH=N: a read of unmapped guest memory on the title's thread at its Nth swap, to try the crash
+    // handler and its dump (app/main.cpp WriteCrashDump)
+    static const uint32_t test_crash = [] {
+        const char* e = std::getenv("XBE_TEST_CRASH");
+        return e ? uint32_t(std::strtoul(e, nullptr, 10)) : 0u;
+    }();
+    static uint32_t swaps = 0;
+    if (test_crash && ++swaps == test_crash) {
+        LOGE("XBE_TEST_CRASH: reading guest 4823D028 at swap %u", swaps);
+        (void)*reinterpret_cast<volatile uint32_t*>(kernel::g_base + 0x4823D028u);
+    }
     uint32_t flags = swap_flags ? swap_flags : kCopy | kFinish;
     if (!(flags & kFinish)) {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
@@ -997,7 +1023,12 @@ uint32_t SwapFrame(X86Context& ctx, uint32_t swap_flags) {
         }
     }
     Walk(Dev(kDevPush));  // reports asked for at the end of the frame
-    if (g_backend) g_backend->Present(SurfaceOf(g_buffers[1]));
+    if (g_backend) {
+        gpu::Surface front = SurfaceOf(g_buffers[1]);
+        front.blend = g_frame_blend.exchange(1);
+        front.blend_new = g_frame_blend_new.exchange(false);
+        g_backend->Present(front);
+    }
     achievements::Frame();
     app::Pace(PresentVblanks());
     // like the XDK, the surfaces stay put and their memory rotates: titles keep back buffer pointers and copy its data
@@ -1336,6 +1367,10 @@ HLE_STDCALL(D3DDevice_CreateVertexShader, 4) {
     }
     gpu::ParseDeclaration(*vs);
     uint32_t rec = mem::AllocSystem(16, 16);
+    // the XDK's object keeps the instruction count at +8 (5849 CreateVertexShader 0x2509F6 in 50 Cent: Bulletproof),
+    // and its GetVertexShaderSize reads it there (0x250E10): that title lays its programs out in program memory by
+    // it, so a zero loaded every program at slot 0 over the last one and its full screen copy drew another program
+    W32(rec + 8, uint32_t(vs->program.size() / 4));
     vs->handle = rec | 1;
     g_vs[vs->handle] = vs;
     W32(out, vs->handle);
@@ -2303,6 +2338,7 @@ void ReplayPushBuffer(uint32_t pb, uint32_t fixup, PbRecording& r) {
         s.pillar_aspect = g_state.pillar_aspect;
         s.pillar_format = g_state.pillar_format;
         s.hud_aspect = g_state.hud_aspect;
+        s.pillar_fill = g_state.pillar_fill;
         s.blank_format = g_state.blank_format;
         if (!g_backend) continue;
         if (!d->up.empty()) {

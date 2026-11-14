@@ -167,6 +167,7 @@ struct Option {  // a setting in the settings file, flag or value
     uint32_t* value;
     const char* label = nullptr;  // the settings window's name for it, else the key
     const char* help = nullptr;   // a line under it in the settings window
+    const char* const* choices = nullptr;  // a value's names, ended by nullptr: a dropdown in the settings window
 };
 // a title's own settings menu (PGR2's Recomp page in its options): sections of rows, each a setting shown as one of a few
 // choices. The settings window (F1) shows the same sections, rows and choices, so the two never disagree
@@ -227,6 +228,9 @@ struct GameInfo {
     // black 32x32 texture from x 0 to 81 and 559 to 640 beside the sight) keeps that edge, as an untextured one always
     // does (gpu::DrawSpan), so the bars reach the screen's sides; off, they are squeezed with the rest of the 2D
     bool edge_bars = false;
+    // ultrawide: an untextured fill ending on the frame's left or right edge (EoN's sniper scope) keeps that edge (gpu::
+    // DrawSpan); off, it is squeezed with the rest of the 2D (PGR2's HUD backdrops behind the times and the speed)
+    bool edge_fills = true;
     // the textures 2D draws use (pretransformed or as above; swizzled, up to 512 texels) are enlarged two or four times
     // with sharp edges (gpu::Sharpen2D, a background thread) and drawn so: text and HUD pictures stay crisp at high
     // resolutions (Settings::sharp_2d turns it off)
@@ -256,6 +260,14 @@ struct GameInfo {
     bool (*texture_bound)(uint32_t header, uint32_t palette) = nullptr;
     // the title draws one frame a step of its game, and the frame cap asks for more: frames in between (gpu/interp.cpp), while true
     bool (*step_interpolation)() = nullptr;
+    // in-between frames draw at the step's place a draw that samples a target drawn this step by draws that cannot be blended
+    // (a reflection pass drawn from a mirrored view each step: blended, what samples it slid against it, back and forth every
+    // other step: EoN's driving floor); off, every matched draw is blended
+    bool interp_sampled_targets_at_step = false;
+    // a vertex stream over a target the GPU drew takes its newest finished copy (a frame or so old) instead of waiting for the GPU
+    // (EoN's driving draws a 128x128 target each frame and draws vertices from it: read back at once, the title waited about 7 ms
+    // a frame behind the in-between frames, and lost the second). Off, it is read back at once (NightFire's scope)
+    bool vertex_read_back_late = false;
     // while true, those frames carry on past the step instead of leading up to it: no delay, for what the player aims
     bool (*step_ahead)() = nullptr;
     // the title draws its world a few vertices at a time with nothing changed between (Agent Under Fire: thousands of draws a
@@ -273,6 +285,14 @@ struct GameInfo {
     // the title's 3D views follow FrameAspect when it changes (PGR2 reshapes its cameras): in a widescreen boot, a choice
     // between 16:9 and filling the screen applies at once; 4:3 against widescreen still waits for the next start
     bool fill_follows_live = false;
+    // while frames run late (slower than 120 a second), each face of a cube map the GPU draws (a car's reflections) is
+    // drawn at most this often a second and keeps its last picture in between; frames on time draw every face. 0 draws
+    // them every frame always. XBE_CUBE_FACE_HZ overrides it
+    float cube_face_hz = 0;
+    // the title widens its 3D views to FrameAspect() from its 4:3 mode too (as from 16:9): a screen between 4:3 and 16:9
+    // (16:10, the Steam Deck's 1280x800) is filled, the console reporting a 4:3 TV and the 2D kept 4:3 in the middle,
+    // where the frame was 16:9 with bars above and below; set once the title's views follow it
+    bool fills_narrow_screens = false;
     // a title's music decoded to PCM streams against its other sounds, read on the audio thread at each mix (effects the
     // DSP image would have balanced drown it out): the level of PCM streams and of every other voice; none is full level
     float (*pcm_stream_level)() = nullptr;
