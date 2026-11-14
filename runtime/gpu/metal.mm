@@ -459,8 +459,38 @@ public:
                        bool ok) override {
         pre_ = &pre;
         pre_ok_ = ok;
+        // XBE_CHECK_PRE=1: each draw assembled ahead is assembled again here, on the render thread, and compared (as the harness's)
+        static const bool check = [] {
+            const char* e = std::getenv("XBE_CHECK_PRE");
+            return e && *e == '1';
+        }();
+        if (check) CheckPre(s, prim, start, count, indices, pre, ok);
         Draw(s, prim, start, count, indices);
         pre_ = nullptr;
+    }
+    void CheckPre(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, const Assembled& a, bool oka) {
+        static Assembled b;
+        static uint64_t n = 0, wrong = 0;
+        const bool okb = Assemble(s, prim, start, count, indices, b);
+        const char* why = nullptr;
+        if (oka != okb) why = "drawn or not";
+        else if (oka) {
+            if (a.regs != b.regs || a.vertex_count != b.vertex_count || a.topology != b.topology || a.strip != b.strip ||
+                a.pretransformed != b.pretransformed || a.decode != b.decode)
+                why = "layout";
+            for (int r = 0; !why && r < 16; r++)
+                if ((a.regs >> r) & 1 && std::memcmp(&a.elements[size_t(r)], &b.elements[size_t(r)], sizeof(a.elements[0]))) why = "elements";
+            if (!why && a.buffer_count != b.buffer_count) why = "buffer count";
+            for (uint32_t i = 0; !why && i < a.buffer_count; i++) {
+                if (a.buffers[i].bytes != b.buffers[i].bytes || a.buffers[i].stride != b.buffers[i].stride) why = "buffer size";
+                else if (std::memcmp(a.buffers[i].src, b.buffers[i].src, a.buffers[i].bytes)) why = "vertex bytes";
+            }
+            if (!why && (a.index_count != b.index_count || a.draw_count != b.draw_count || a.base_vertex != b.base_vertex || a.index16 != b.index16)) why = "draw";
+            if (!why && a.index_count && std::memcmp(a.index_src, b.index_src, size_t(a.index_count) * (a.index16 ? 2 : 4))) why = "indices";
+        }
+        n++;
+        if (why && wrong++ < 8) LOGR("prep check: draw %llu assembled differently (%s)", (unsigned long long)n, why);
+        if (n % 200000 == 0) LOGR("prep check: %llu draws assembled ahead, %llu different", (unsigned long long)n, (unsigned long long)wrong);
     }
     void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) override;
     void Present(const Surface& front) override;

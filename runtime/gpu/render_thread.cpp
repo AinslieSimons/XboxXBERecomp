@@ -181,13 +181,8 @@ public:
         defer_ = inner_->DeferWork(true);
         pre_ = [] {
             const char* e = std::getenv("XBE_PRE_ASSEMBLE");
-#ifdef __APPLE__
-            // Metal assembles in its own Draw until it takes the prep thread's work (MetalBackend::DrawAssembled)
-            const bool dflt = false;
-#else
-            const bool dflt = true;
-#endif
-            bool on = e && *e ? *e != '0' : dflt;
+            // on everywhere: Metal takes the prep thread's work in MetalBackend::DrawAssembled
+            bool on = !(e && *e == '0');
             LOGR("render thread: draws assembled %s", on ? "one step ahead on the prep thread" : "by the render thread (XBE_PRE_ASSEMBLE=0)");
             return on;
         }();
