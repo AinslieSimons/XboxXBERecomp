@@ -454,6 +454,14 @@ public:
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                uint32_t stencil) override;
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override;
+    // a draw the render thread's prep thread assembled from this state (XBE_PRE_ASSEMBLE=1): Draw uses it in place of Assemble
+    void DrawAssembled(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, const Assembled& pre,
+                       bool ok) override {
+        pre_ = &pre;
+        pre_ok_ = ok;
+        Draw(s, prim, start, count, indices);
+        pre_ = nullptr;
+    }
     void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) override;
     void Present(const Surface& front) override;
     void Sync(uint32_t data, uint32_t size) override;
@@ -710,6 +718,8 @@ private:
     std::deque<Report> reports_;
     std::mutex reports_lock_;                 // reports_: the drawing thread, and command buffers completing
     Assembled asm_;  // kept between draws for its buffers
+    const Assembled* pre_ = nullptr;  // DrawAssembled's draw: read only
+    bool pre_ok_ = false;
     bool draw_2d_ = false;
     Target* bound_rt_ = nullptr;
     Target* bound_ds_ = nullptr;
@@ -2707,8 +2717,9 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             return;
         }
         perf::Lap lap;
-        Assembled& a = asm_;
-        if (!Assemble(s, prim, start, count, indices, a)) return;
+        if (!pre_ && !Assemble(s, prim, start, count, indices, asm_)) return;
+        if (pre_ && !pre_ok_) return;
+        const Assembled& a = pre_ ? *pre_ : asm_;
         lap.Mark(perf::kStAssemble);
         if (!BindTargets(s)) return;
         lap.Mark(perf::kStTargets);
