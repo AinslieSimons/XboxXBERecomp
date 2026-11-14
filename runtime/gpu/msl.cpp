@@ -88,6 +88,9 @@ void FixKnown(std::string& s) {
         {"return (1.0 / v).xxxx;", "return float4(1.0 / v);"},
         {"return magclamp(1.0 / v).xxxx;", "return float4(magclamp(1.0 / v));"},
         {"return v == 0 ? (1.#INF).xxxx : (rsqrt(abs(v))).xxxx;", "return float4(v == 0 ? INFINITY : rsqrt(abs(v)));"},
+        // upstream's Wine-friendly text (the largest float for infinity): Metal keeps the infinities
+        {"return v == 0 ? (3.402823e38).xxxx : (rsqrt(abs(v))).xxxx;", "return float4(v == 0 ? INFINITY : rsqrt(abs(v)));"},
+        {"float4(-3.402823e38, 1, -3.402823e38, 1)", "float4(-INFINITY, 1, -INFINITY, 1)"},
         {"1.#INF", "INFINITY"},
         {"return (b - (b >= 128 ? hi : lo)) / d;", "return (b - select(float3(lo), float3(hi), b >= 128)) / d;"},
         {"return t + (d.x ? d.x / g.x * ddx(t) : 0) + (d.y ? d.y / g.y * ddy(t) : 0);",
