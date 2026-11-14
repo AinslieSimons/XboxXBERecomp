@@ -289,10 +289,6 @@ struct GameInfo {
     // drawn at most this often a second and keeps its last picture in between; frames on time draw every face. 0 draws
     // them every frame always. XBE_CUBE_FACE_HZ overrides it
     float cube_face_hz = 0;
-    // the title widens its 3D views to FrameAspect() from its 4:3 mode too (as from 16:9): a screen between 4:3 and 16:9
-    // (16:10, the Steam Deck's 1280x800) is filled, the console reporting a 4:3 TV and the 2D kept 4:3 in the middle,
-    // where the frame was 16:9 with bars above and below; set once the title's views follow it
-    bool fills_narrow_screens = false;
     // a title's music decoded to PCM streams against its other sounds, read on the audio thread at each mix (effects the
     // DSP image would have balanced drown it out): the level of PCM streams and of every other voice; none is full level
     float (*pcm_stream_level)() = nullptr;
