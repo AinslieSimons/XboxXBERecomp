@@ -222,7 +222,7 @@ constexpr uint64_t kStaleFrames = 8;       // frames a target may go unused and 
 constexpr uint32_t kRingBytes = 96u << 20;  // per frame: vertices, indices, constants, uploads
 constexpr int kFramesInFlight = 4;  // rings: the frame being written and up to three the GPU has yet to finish
 constexpr int kLateSlots = 3;              // copies in flight per surface locked without a wait
-constexpr uint32_t kVisSlots = 1u << 16;   // visibility counters, 8 bytes each
+constexpr uint32_t kVisSlots = 1u << 15;   // visibility counters, 8 bytes each: Apple GPUs count at offsets below 256 KB only
 constexpr uint32_t kVertexBufferBase = 1;  // buffer 0 holds the constants
 
 // a console surface drawn into
@@ -2321,6 +2321,34 @@ void MetalBackend::AddToScene(const State& s, uint32_t prim, uint32_t start, uin
         w[9] = material;  // the object: BuildScene
         scene_colour_.insert(scene_colour_.end(), w, w + kTraceWords);
     }
+    // XBE_TRACE_DUMP=frame (testing): that frame's traced scene as text, trace_scene_<frame>.txt beside the exe: a line
+    // per draw ("d draw glass r g b a" then the 12 numbers of its world transform and its triangle count) then a line
+    // per vertex ("v x y z nx ny nz u v", in the world). tools/smoke-lab/car_from_scene.py makes a car model of it.
+    static const uint64_t dump = std::getenv("XBE_TRACE_DUMP") ? std::strtoull(std::getenv("XBE_TRACE_DUMP"), nullptr, 10) : 0;
+    if (dump && g_trace_presents == dump) {
+        static FILE* f = nullptr;
+        if (!f) {
+            const auto path = app::ExeDir() / ("trace_scene_" + std::to_string(dump) + ".txt");
+            f = std::fopen(path.string().c_str(), "w");
+            LOGR("metal: the traced scene of frame %llu into %s", (unsigned long long)dump, path.string().c_str());
+        }
+        if (f) {
+            std::fprintf(f, "d %u %d %.4f %.4f %.4f %.4f", a.trace_draw, int(a.trace_glass), c[0], c[1], c[2], c[3]);
+            for (int k = 0; k < 12; k++) std::fprintf(f, " %.6g", m[k]);
+            std::fprintf(f, " %zu\n", n_verts / 3);
+            for (size_t v = 0; v < n_verts; v++) {
+                const float* p = &scene_xyz_[from + v * 3];
+                float n[3] = {0, 0, 0};
+                if (have_n) {
+                    const float* o = &normals[v * 3];
+                    for (int r = 0; r < 3; r++) n[r] = m[r * 4] * o[0] + m[r * 4 + 1] * o[1] + m[r * 4 + 2] * o[2];
+                }
+                const float uu = uvs.size() == mesh->xyz.size() ? uvs[v * 3] : 0, vv = uvs.size() == mesh->xyz.size() ? uvs[v * 3 + 1] : 0;
+                std::fprintf(f, "v %.4f %.4f %.4f %.3f %.3f %.3f %.4f %.4f\n", p[0], p[1], p[2], n[0], n[1], n[2], uu, vv);
+            }
+            std::fflush(f);
+        }
+    }
 }
 
 // the frame's scene into the slot the next frame draws with (its last use done: Present waited for it)
@@ -2960,7 +2988,7 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             uint32_t slot = vis_next_++ % kVisSlots;
             static_cast<uint64_t*>(vis_.contents)[slot] = 0;
             [enc_ setVisibilityResultMode:MTLVisibilityResultModeCounting offset:slot * 8];
-            counted_.push_back({slot, 0, SamplesPerPixel()});
+            counted_.push_back({slot, 0, SamplesPerPixel() / float(std::max<uint32_t>(s.count_samples, 1))});
         }
         lap.Mark(perf::kStTextureSet);
         DrawGeometry(a, *p);

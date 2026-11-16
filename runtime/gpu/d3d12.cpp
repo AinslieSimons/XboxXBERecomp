@@ -568,7 +568,7 @@ private:
     // visibility tests
     bool EnsureQueries();
     uint32_t BeginCountedDraw(const State& s);
-    void EndCountedDraw(uint32_t query);
+    void EndCountedDraw(uint32_t query, const State& s);
     float SamplesPerPixel() const;
     void DeliverReports();
     // shaders by source hash: Compile returns the bytecode and sets hash
@@ -3219,10 +3219,11 @@ uint32_t D3D12Backend::BeginCountedDraw(const State& s) {
     return query;
 }
 
-void D3D12Backend::EndCountedDraw(uint32_t query) {
+void D3D12Backend::EndCountedDraw(uint32_t query, const State& s) {
     if (query == kNoQuery) return;
     rec_.EndQuery(query_heap_.Get(), query_rb_.Get(), query);
-    counted_.push_back({query, rec_spp_});  // the samples per pixel decide found for the draw's targets
+    // the samples per pixel decide found for the draw's targets, in the console's samples (its back buffer's count)
+    counted_.push_back({query, rec_spp_ / float(std::max<uint32_t>(s.count_samples, 1))});
 }
 
 // the console counts its own pixels: the bound target's scale and multisampling come out
@@ -3731,7 +3732,7 @@ void D3D12Backend::Record(DrawPacket& p, PerfClock::time_point& perf_post) {
     g_perf.notes += PerfMs(perf_step);  // the skip checks, the draw's note, the shader log
     perf_step = PerfNow();
     DrawGeometry(a);
-    EndCountedDraw(query);
+    EndCountedDraw(query, s);
     g_perf.geometry += PerfMs(perf_step);
     perf_post = PerfNow();
     // XBE_CAPTURE_DRAWS: the target after each draw in the range (cap_i_ moved on past this draw's number)

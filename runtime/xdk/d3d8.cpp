@@ -353,6 +353,7 @@ void UpdateSampleScale() {
         return v;
     }();
     if (off) g_state.aa_x = g_state.aa_y = 1;
+    g_state.count_samples = made_x * made_y;
     // each target the back buffer's mode is asked on, once: applied (the back buffer) or not (another target)
     uint32_t asked = g_state.rs[gpu::kRsMultiSampleMode];
     if (asked && g_state.rt.header) {

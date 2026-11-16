@@ -1933,7 +1933,7 @@ void D3D11Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     DrawGeometry(a);
     if (query) {
         ctx_->End(query.Get());
-        counted_.push_back({query, SamplesPerPixel()});
+        counted_.push_back({query, SamplesPerPixel() / float(std::max<uint32_t>(s.count_samples, 1))});
     }
 }
 
