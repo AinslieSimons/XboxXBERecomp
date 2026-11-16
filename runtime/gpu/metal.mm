@@ -222,7 +222,7 @@ constexpr uint64_t kStaleFrames = 8;       // frames a target may go unused and 
 constexpr uint32_t kRingBytes = 96u << 20;  // per frame: vertices, indices, constants, uploads
 constexpr int kFramesInFlight = 4;  // rings: the frame being written and up to three the GPU has yet to finish
 constexpr int kLateSlots = 3;              // copies in flight per surface locked without a wait
-constexpr uint32_t kVisSlots = 1u << 16;   // visibility counters, 8 bytes each
+constexpr uint32_t kVisSlots = 1u << 15;   // visibility counters, 8 bytes each: Apple GPUs count at offsets below 256 KB only
 constexpr uint32_t kVertexBufferBase = 1;  // buffer 0 holds the constants
 
 // a console surface drawn into
@@ -2916,7 +2916,7 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             uint32_t slot = vis_next_++ % kVisSlots;
             static_cast<uint64_t*>(vis_.contents)[slot] = 0;
             [enc_ setVisibilityResultMode:MTLVisibilityResultModeCounting offset:slot * 8];
-            counted_.push_back({slot, 0, SamplesPerPixel()});
+            counted_.push_back({slot, 0, SamplesPerPixel() / float(std::max<uint32_t>(s.count_samples, 1))});
         }
         lap.Mark(perf::kStTextureSet);
         DrawGeometry(a, *p);

@@ -216,6 +216,9 @@ struct State {
     // one, each pixel covering aa_x by aa_y of its samples (EoN's particles: 4X on its 640x480 buffer, drawn 320x240
     // and stretched). Positions, the viewport and scissors are in those larger pixels.
     uint32_t aa_x = 1, aa_y = 1;
+    // the samples a console pixel holds on the bound target: a visibility test counts samples, not pixels (PGR2 divides
+    // its counts by its multisample count, 2 on its 2X back buffer); the back buffer's made samples, else 1
+    uint32_t count_samples = 1;
     // ultrawide: a game hook spreads the 2D being drawn wider than the 4:3 frame (a 4:3 HUD laid out at 16:9): each
     // draw moved by squeeze_shift guest pixels (a left panel left, a right one right, set per element) as it is
     // squeezed, its shape kept; no corner is kept on the frame's edges meanwhile (a letter's edge may fall on one)
