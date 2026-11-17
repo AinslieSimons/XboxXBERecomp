@@ -1155,7 +1155,7 @@ Target* MetalBackend::FindTarget(const Surface& s, bool depth) {
 
 // the scene's targets, as big as the console's screen, and the depth drawn with them. Not the water's reflection (g_small_target)
 bool MetalBackend::MsEligible(const Target& t) const {
-    if (msaa_ <= 1 || (t.data && (t.data == g_small_target[0].load() || t.data == g_small_target[1].load()))) return false;
+    if (msaa_ <= 1 || FixedScale(t.data) || (t.data && (t.data == g_small_target[0].load() || t.data == g_small_target[1].load()))) return false;
     return t.depth || (t.gw == guest_w_ && t.gh == guest_h_);
 }
 
@@ -1196,8 +1196,14 @@ void MetalBackend::RefreshMs(Target& t) {
 
 bool MetalBackend::CreateTarget(Target& t) {
     const float small = t.data && (t.data == g_small_target[0].load() || t.data == g_small_target[1].load()) ? small_factor_ : 1.0f;
-    t.w = std::max(1u, uint32_t(std::lround(t.gw * scale_ * small * XStretch(aspect_, guest_h_, t.gw, t.gh))));
-    t.h = std::max(1u, uint32_t(std::lround(t.gh * scale_ * small)));
+    if (FixedScale(t.data)) {
+        const float f = std::clamp(g_fixed_scale.load(), 0.25f, 4.0f);
+        t.w = std::max(1u, uint32_t(std::lround(t.gw * f)));
+        t.h = std::max(1u, uint32_t(std::lround(t.gh * f)));
+    } else {
+        t.w = std::max(1u, uint32_t(std::lround(t.gw * scale_ * small * XStretch(aspect_, guest_h_, t.gw, t.gh))));
+        t.h = std::max(1u, uint32_t(std::lround(t.gh * scale_ * small)));
+    }
     MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:t.depth ? kDepth : kBgra width:t.w height:t.h mipmapped:NO];
     td.storageMode = MTLStorageModePrivate;
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;

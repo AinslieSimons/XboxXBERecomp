@@ -112,6 +112,11 @@ inline std::atomic<bool> g_reports_wait{false};
 // a pair of targets drawn smaller than the render scale (by their data addresses, colour and depth; 0 none), and by how much
 inline std::atomic<uint32_t> g_small_target[2] = {0, 0};
 inline std::atomic<float> g_small_target_factor{1.0f};
+// targets whose data lies in [lo, hi) are made at this many pixels per guest pixel whatever the render scale, without MSAA (a
+// title's own small passes: PGR2's street light shadow maps); 0 none
+inline std::atomic<uint32_t> g_fixed_scale_lo{0}, g_fixed_scale_hi{0};
+inline std::atomic<float> g_fixed_scale{1.0f};
+inline bool FixedScale(uint32_t data) { return data && data >= g_fixed_scale_lo.load() && data < g_fixed_scale_hi.load(); }
 inline std::atomic<uint32_t> g_shaders_compiled{0};  // D3DCompile calls (the shader cache missed), for the frames lines
 
 // F3: save the next frame, every draw and target, under diag::CaptureDir
