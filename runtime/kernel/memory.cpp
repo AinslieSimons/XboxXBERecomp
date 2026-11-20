@@ -508,6 +508,16 @@ void FreeStack(uint32_t top) {
     g_stack_tops.erase(it);
 }
 
+uint32_t StacksInUse(uint32_t* bytes) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (bytes) {
+        uint64_t n = 0;
+        for (auto& [top, bottom] : g_stack_tops) n += top - bottom;
+        *bytes = uint32_t(std::min<uint64_t>(n, 0xFFFFFFFFu));
+    }
+    return uint32_t(g_stack_tops.size());
+}
+
 uint32_t AllocationSize(uint32_t va) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (uint32_t s = g_contig.SizeOf(va)) return s;

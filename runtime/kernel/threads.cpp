@@ -52,6 +52,13 @@ void SetupGuestBlocks(Thread& t, uint32_t stack_size, uint32_t tls_size) {
     t.stack_size = stack_size;
     t.kpcr = mem::AllocSystem(kKpcrSize, 64);
     t.ethread = mem::AllocSystem(kEthreadSize, 64);
+    // without a stack the thread's first push lands near guest address 0 and faults far from the cause
+    if (!t.stack_top || !t.kpcr || !t.ethread) {
+        LOGE("threads: no guest memory for thread %X (stack %X bytes: %08X, kpcr %08X, ethread %08X)", t.id,
+             stack_size + tls_size + 0x1000, t.stack_top, t.kpcr, t.ethread);
+        logx::Flush();
+        std::abort();
+    }
     // TLS sits at the top of the stack: StackBase + tls_index * 4 must equal TlsData
     t.tls = t.stack_top - tls_size;
     uint32_t k = t.kpcr;
@@ -71,6 +78,19 @@ void SetupGuestBlocks(Thread& t, uint32_t stack_size, uint32_t tls_size) {
     W32(e + 0x28, t.tls);                       // KTHREAD.TlsData
     W32(e + 0x44, Process());                   // KTHREAD.ApcState.Process
     W32(e + 0x12C, t.id);                       // ETHREAD.UniqueThread
+}
+
+// At exit the stack (with its TLS) and the KPCR go back: only the thread itself uses them. The ETHREAD stays, it is
+// the thread object other threads wait on and reach by pointer or handle after the exit. Without this every thread
+// the game starts keeps 192 KB of the 256 MB stack range, and after about 1360 threads (PGR2: hours of area loads)
+// the next one gets no stack.
+void ReleaseGuestBlocks(Thread& t) {
+    if (t.stack_top) mem::FreeStack(t.stack_top);
+    if (t.kpcr) mem::FreeSystem(t.kpcr);
+    W32(t.ethread + 0x1C, 0);  // KTHREAD.StackBase
+    W32(t.ethread + 0x20, 0);  // KTHREAD.StackLimit
+    W32(t.ethread + 0x28, 0);  // KTHREAD.TlsData
+    t.stack_top = t.kpcr = t.tls = 0;
 }
 
 void InitContext(Thread& t, X86Context& ctx) {
@@ -177,6 +197,13 @@ ThreadRef CreateThread(uint32_t stack_size, uint32_t tls_size, uint32_t system_r
 
 void StartThread(ThreadRef t) {
     Register(t);
+    static std::atomic<uint32_t> started{0};
+    if (++started % 32 == 0) {
+        uint32_t bytes;
+        uint32_t n = mem::StacksInUse(&bytes);
+        LOGR("threads: %u guest threads started, %u stacks in use (%u KB of %u KB)", started.load(), n, bytes >> 10,
+             mem::kStackSize >> 10);
+    }
     Spawn([t] {
         t_current = t;
         char name[32];
@@ -205,6 +232,7 @@ void StartThread(ThreadRef t) {
         DropDispatch();
         MarkExited(*t, code);
         Unregister(t.get());
+        ReleaseGuestBlocks(*t);
         t_current.reset();
     });
 }
@@ -232,6 +260,7 @@ void ExitThread(uint32_t code) {
         DropDispatch();
         MarkExited(*t, code);
         Unregister(t);
+        ReleaseGuestBlocks(*t);
     }
     t_current.reset();
 #ifdef _WIN32

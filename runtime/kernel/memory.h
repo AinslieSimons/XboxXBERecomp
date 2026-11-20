@@ -53,6 +53,7 @@ void FreeSystem(uint32_t va);
 
 uint32_t AllocStack(uint32_t size);  // returns the top, guard below the bottom
 void FreeStack(uint32_t top);
+uint32_t StacksInUse(uint32_t* bytes = nullptr);  // count and reserved bytes, guards included
 
 uint32_t PhysicalFromVirtual(uint32_t va);
 uint32_t VirtualFromPhysical(uint32_t pa);
