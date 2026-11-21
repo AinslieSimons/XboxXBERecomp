@@ -497,6 +497,12 @@ int main(int argc, char** argv) {
     std::string log = app::kGame.log;
     if (app::Instance() > 1) log += "-" + std::to_string(app::Instance());
     logx::Init((app::ExeDir() / "logs").string(), log);
+    // no App Nap or timer coalescing while the game runs: behind other windows or occluded, macOS would otherwise slow its
+    // timers and threads (a test run in the background measured about 3x slower). Idle sleep stays allowed
+    static id<NSObject> activity = [[NSProcessInfo processInfo]
+        beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep | NSActivityLatencyCritical
+                          reason:@"game running"];
+    (void)activity;
     SDL_SetHint(SDL_HINT_MAC_CTRL_CLICK_EMULATE_RIGHT_CLICK, "0");
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {

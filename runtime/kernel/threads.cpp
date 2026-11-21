@@ -155,6 +155,11 @@ void Spawn(std::function<void()> fn) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 64u << 20);
+#ifdef __APPLE__
+    // the console's threads all run on its one CPU at once: on Apple silicon, performance cores (an unclassed thread may be
+    // put on an efficiency core under load or on battery)
+    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     pthread_t th;
     pthread_create(&th, &attr, [](void* p) -> void* {
         std::unique_ptr<std::function<void()>> g(static_cast<std::function<void()>*>(p));

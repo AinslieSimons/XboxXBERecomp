@@ -36,6 +36,9 @@
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
+#ifdef __APPLE__
+#include <pthread.h>
+#endif
 
 namespace gpu {
 
@@ -323,6 +326,7 @@ public:
             if (told++ < 4) LOGR("render thread: vertices over %08X: no finished copy yet, read back now", data);
             ReadBack(data, true);
         } else if (drawn) {
+            if (data == last_written_) last_written_ = 0;
             written_.erase(data);
             static int told = 0;
             if (told++ < 4) LOGR("render thread: vertices over %08X take its newest finished copy (vertex_read_back_late)", data);
@@ -451,6 +455,7 @@ private:
 
     void ReadBack(uint32_t data, bool late) {
         // only surfaces the GPU wrote since the last read-back hold anything newer than guest memory
+        if (data == last_written_) last_written_ = 0;
         if (!written_.erase(data)) return;
         (late ? g_perf_sync_late : g_perf_sync_block)++;
         if (diag::Perf() && logged_.insert(uint64_t(data) << 1 | (late ? 1 : 0)).second)
@@ -562,9 +567,15 @@ private:
         *r.value = cur_->id;
     }
     std::unordered_set<uint32_t> late_vertices_;  // targets vertices were read from late (SyncVertices)
+    // the same target as the draw before is already in written_ (every erase forgets last_written_)
     void Written(const Surface& s) {
-        if (s.header) written_.insert(mem::VirtualFromPhysical(s.data));
+        if (!s.header) return;
+        const uint32_t data = mem::VirtualFromPhysical(s.data);
+        if (data == last_written_) return;
+        written_.insert(data);
+        last_written_ = data;
     }
+    uint32_t last_written_ = 0;
 
     uint64_t Submit() {
         uint64_t id = cur_->id;
@@ -868,6 +879,17 @@ private:
     }
 
     static void NameThread(const wchar_t* name) {
+#ifdef __APPLE__
+        // a name in profiles and threads.csv, and the drawing threads kept on performance cores
+        char narrow[64];
+        size_t i = 0;
+        for (; name[i] && i < 63; i++) narrow[i] = char(name[i]);
+        narrow[i] = 0;
+        pthread_setname_np(narrow);
+        perf::NameThread(narrow);
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        return;
+#endif
         using SetDescription = HRESULT(WINAPI*)(HANDLE, PCWSTR);
         if (auto set = reinterpret_cast<SetDescription>(
                 reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription"))))
