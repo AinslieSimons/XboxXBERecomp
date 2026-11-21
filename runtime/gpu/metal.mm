@@ -3,6 +3,7 @@
 // bias, renderer extensions, F3 captures.
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <MetalFX/MetalFX.h>
 #include <objc/runtime.h>
 #include <dispatch/dispatch.h>
 
@@ -589,7 +590,9 @@ private:
     id<MTLCommandBuffer> Cb();
     id<MTLCommandBuffer> Commit();  // what was recorded goes to the GPU; returns it
     void EndEncoder();
-    void OpenPass(id<MTLTexture> colour, id<MTLTexture> depth, id<MTLTexture> resolve_colour = nil, id<MTLTexture> resolve_depth = nil);
+    // take_clears: a whole clear of colour or depth still pending (ClearWhole) becomes this pass's load action
+    void OpenPass(id<MTLTexture> colour, id<MTLTexture> depth, id<MTLTexture> resolve_colour = nil, id<MTLTexture> resolve_depth = nil,
+                  bool take_clears = false);
     id<MTLBlitCommandEncoder> Blitter();  // ends the render pass; end it after use
     // the run of reflection passes being recorded for a worker, null none
     std::shared_ptr<EncRun> run_;
@@ -637,6 +640,20 @@ private:
     void Blit(id<MTLTexture> src, const float uvrect[4], const BlitOptions& o);
     bool DepthCopy(const State& s);
     void ClearWhole(Target& t, uint32_t flags, const float colour[4], float z, uint32_t stencil);
+    void EncodeClear(Target& t, uint32_t flags, const float colour[4], float z, uint32_t stencil);
+    // Deferred clears: a clear of a whole target waits for the next pass a draw opens on it, and is that pass's load action, so
+    // the target is not written out cleared (a multisampled twin and its resolve: tens of MB) and loaded back. Anything else
+    // that reads or writes the target first encodes it as a pass of its own, as before (FlushClear). XBE_NO_DEFER_CLEAR=1: off
+    struct PendingClear {
+        Target* t;
+        id<MTLTexture> into;  // the twin or res it clears
+        uint32_t flags, stencil;
+        float colour[4], z;
+    };
+    std::vector<PendingClear> pending_clears_;
+    void FlushClear(const Target& t);
+    void FlushClearTexture(id<MTLTexture> tex);
+    void FlushClears();
     void ClearRects(Target& t, const std::vector<RECT>& rs, uint32_t flags, const float colour[4], float z, uint32_t stencil);
     void CopyByDraw(Target& src_t, Target& dst_t, uint32_t count, uint32_t src_rects, uint32_t dst_points);
     void CopyByRegion(Target& src_t, Target& dst_t, uint32_t count, uint32_t src_rects, uint32_t dst_points);
@@ -729,6 +746,16 @@ private:
     bool enc_has_viewport_ = false;
 
     id<MTLTexture> lut_;
+    // Settings::scale_filter 2: the frame enlarged to the screen by MetalFX's spatial scaler, then the usual final pass at 1:1
+    // the last two kept: the menus' 4:3 frame and the race's switch back and forth
+    struct FxScaler {
+        id<MTLFXSpatialScaler> scaler;
+        id<MTLTexture> out;
+        uint32_t in_w = 0, in_h = 0, out_w = 0, out_h = 0;
+    };
+    FxScaler fx_[2];
+    bool fx_failed_ = false;
+    id<MTLTexture> MetalFxUpscale(id<MTLTexture> frame, uint32_t out_w, uint32_t out_h);
     id<MTLSamplerState> pass_samplers_[4];
     id<MTLDepthStencilState> no_depth_, depth_always_;
     id<MTLTexture> dummy_2d_, dummy_3d_, dummy_cube_, dummy_depth_;
@@ -1020,24 +1047,46 @@ static void ResolveDepthInto(MTLRenderPassDescriptor* d, id<MTLTexture> to) {
     d.stencilAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
 }
 
-void MetalBackend::OpenPass(id<MTLTexture> colour, id<MTLTexture> depth, id<MTLTexture> resolve_colour, id<MTLTexture> resolve_depth) {
+void MetalBackend::OpenPass(id<MTLTexture> colour, id<MTLTexture> depth, id<MTLTexture> resolve_colour, id<MTLTexture> resolve_depth,
+                           bool take_clears) {
     if (enc_ && enc_colour_ == colour && enc_depth_ == depth) return;
+    // a pending clear of these: this pass's load action when the draw takes it, else made first
+    const PendingClear* cc = nullptr;
+    const PendingClear* dc = nullptr;
+    if (!take_clears) {
+        FlushClearTexture(colour);
+        FlushClearTexture(depth);
+    } else {
+        for (const PendingClear& p : pending_clears_) {
+            if (colour && p.into == colour && !p.t->depth) cc = &p;
+            if (depth && p.into == depth && p.t->depth) dc = &p;
+        }
+    }
     EndEncoder();
     MTLRenderPassDescriptor* d = [MTLRenderPassDescriptor renderPassDescriptor];
     if (colour) {
         d.colorAttachments[0].texture = colour;
-        d.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        d.colorAttachments[0].loadAction = cc ? MTLLoadActionClear : MTLLoadActionLoad;
+        if (cc) d.colorAttachments[0].clearColor = MTLClearColorMake(cc->colour[0], cc->colour[1], cc->colour[2], cc->colour[3]);
         d.colorAttachments[0].storeAction = MTLStoreActionStore;
         if (resolve_colour) ResolveInto(d.colorAttachments[0], resolve_colour);
     }
     if (depth) {
         d.depthAttachment.texture = depth;
-        d.depthAttachment.loadAction = MTLLoadActionLoad;
+        d.depthAttachment.loadAction = dc && (dc->flags & kClearZ) ? MTLLoadActionClear : MTLLoadActionLoad;
+        if (dc) d.depthAttachment.clearDepth = std::clamp(dc->z, 0.0f, 1.0f);
         d.depthAttachment.storeAction = MTLStoreActionStore;
         d.stencilAttachment.texture = depth;
-        d.stencilAttachment.loadAction = MTLLoadActionLoad;
+        d.stencilAttachment.loadAction = dc && (dc->flags & kClearStencil) ? MTLLoadActionClear : MTLLoadActionLoad;
+        if (dc) d.stencilAttachment.clearStencil = dc->stencil & 0xFF;
         d.stencilAttachment.storeAction = MTLStoreActionStore;
         if (resolve_depth) ResolveDepthInto(d, resolve_depth);
+    }
+    if (cc || dc) {
+        perf::Add(perf::kNClearsFolded);
+        const Target* ct = cc ? cc->t : nullptr;
+        const Target* dt = dc ? dc->t : nullptr;
+        std::erase_if(pending_clears_, [&](const PendingClear& p) { return p.t == ct || p.t == dt; });
     }
     d.visibilityResultBuffer = vis_;
     perf::Add(perf::kNEncoders);
@@ -1181,6 +1230,7 @@ bool MetalBackend::EnsureMs(Target& t) {
 // res's pixels into the twin, after something other than the twin wrote them
 void MetalBackend::RefreshMs(Target& t) {
     if (!t.ms || !t.ms_stale) return;
+    FlushClear(t);
     t.ms_stale = false;
     if (!t.depth) {
         SetPassTarget(t.ms, nil, t.w, t.h);
@@ -1244,6 +1294,7 @@ Target* MetalBackend::EnsureTarget(const Surface& s, bool depth, uint32_t gw, ui
     if (it != targets_.end()) {
         if (it->second.gw == sw && it->second.gh == sh) return &it->second;
         if (bound_rt_ == &it->second || bound_ds_ == &it->second) Unbind();
+        FlushClears();  // none may point at it
         targets_.erase(it);
     }
     Target t;
@@ -1313,6 +1364,7 @@ bool MetalBackend::BindTargets(const State& s) {
 
 // CPU pixels of a colour surface into its target, scaled
 void MetalBackend::UploadTarget(Target& t, const Surface& s) {
+    FlushClear(t);
     TextureDesc d;
     if (!Describe(s.header, d) || Format(d.format).depth) return;
     std::vector<uint8_t> px;
@@ -1351,6 +1403,7 @@ id<MTLTexture> MetalBackend::Shrink(Target& t, uint32_t w, uint32_t h) {
 }
 
 id<MTLTexture> MetalBackend::PrepareCopySource(Target& t) {
+    FlushClear(t);
     if (t.w != t.gw || t.h != t.gh) return Shrink(t, t.gw, t.gh);
     return t.res;
 }
@@ -1377,6 +1430,7 @@ bool MetalBackend::ReadBack(id<MTLTexture> src, uint32_t w, uint32_t h, std::vec
 // the CPU reads a surface the GPU drew: bring the pixels back
 void MetalBackend::Sync(uint32_t data, uint32_t) {
     @autoreleasepool {
+        FlushClears();
         auto it = targets_.find(TargetMapKey(data, false));
         if (it == targets_.end() || !it->second.drawn || TargetStale(data)) return;
         Target& t = it->second;
@@ -1420,6 +1474,7 @@ bool MetalBackend::DeliverLate(uint32_t data) {
 
 void MetalBackend::RecordLate(uint32_t data) {
     @autoreleasepool {
+        FlushClears();
         auto it = targets_.find(TargetMapKey(data, false));
         if (it == targets_.end() || TargetStale(data) || !it->second.linear32) return;
         Target& t = it->second;
@@ -1750,10 +1805,10 @@ void MetalBackend::FullScreen(const PassFn& f, const float* cb, uint32_t cb_floa
 // src over the bound viewport and scissor
 void MetalBackend::Blit(id<MTLTexture> src, const float uvrect[4], const BlitOptions& o) {
     const app::Settings& st = app::Get();
-    const bool final = o.final && (st.fxaa || st.sharpen || st.scale_filter);
+    const bool final = o.final && (st.fxaa || st.sharpen || st.scale_filter == 1);
     PassFn f = PassFunctions(kBlitHlsl, "vs", final ? "psfinal" : "psmain");
     float c[8] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3], o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), 1.0f};
-    if (final) c[5] = float((st.fxaa ? 1 : 0) | (st.scale_filter ? 2 : 0)), c[6] = float(std::min<uint32_t>(st.sharpen, 100)) / 100.0f;
+    if (final) c[5] = float((st.fxaa ? 1 : 0) | (st.scale_filter == 1 ? 2 : 0)), c[6] = float(std::min<uint32_t>(st.sharpen, 100)) / 100.0f;
     id<MTLTexture> tex[2] = {src, lut_};
     FullScreen(f, c, 8, tex, 2, o.over, no_depth_);
 }
@@ -1769,6 +1824,7 @@ bool MetalBackend::DepthCopy(const State& s) {
     if (di == targets_.end() || si == targets_.end() || di == si) return false;
     Target& dst = di->second;
     Target& src = si->second;
+    FlushClears();
     PassFn f = PassFunctions(kDepthHlsl, "vs", "psmain");
     if (!f.vs || !f.fs) return false;
     if (dst.ms) dst.ms_stale = true;
@@ -1782,10 +1838,44 @@ bool MetalBackend::DepthCopy(const State& s) {
 // ---- clears
 
 void MetalBackend::ClearWhole(Target& t, uint32_t flags, const float colour[4], float z, uint32_t stencil) {
-    EndEncoder();
-    MTLRenderPassDescriptor* d = [MTLRenderPassDescriptor renderPassDescriptor];
+    static const bool no_defer = std::getenv("XBE_NO_DEFER_CLEAR") && *std::getenv("XBE_NO_DEFER_CLEAR") == '1';
+    FlushClear(t);  // an earlier one first
     id<MTLTexture> into = t.ms ? t.ms : t.res;  // a twin is cleared and resolved
     if (t.ms && (!t.depth || ((flags & kClearZ) && (flags & kClearStencil)))) t.ms_stale = false;
+    // a twin left stale is refreshed from res before its next draw, which would paint over a clear made into it later
+    if (no_defer || (t.ms && t.ms_stale)) {
+        EncodeClear(t, flags, colour, z, stencil);
+        return;
+    }
+    PendingClear p{&t, into, flags, stencil, {colour[0], colour[1], colour[2], colour[3]}, z};
+    pending_clears_.push_back(p);
+    if (enc_ && (enc_colour_ == into || enc_depth_ == into)) EndEncoder();  // the next draw opens a pass that clears
+}
+
+void MetalBackend::FlushClear(const Target& t) {
+    for (size_t i = 0; i < pending_clears_.size(); i++) {
+        if (pending_clears_[i].t != &t) continue;
+        PendingClear p = pending_clears_[i];
+        pending_clears_.erase(pending_clears_.begin() + long(i));
+        EncodeClear(*p.t, p.flags, p.colour, p.z, p.stencil);
+        return;
+    }
+}
+
+void MetalBackend::FlushClearTexture(id<MTLTexture> tex) {
+    if (!tex) return;
+    for (const PendingClear& p : pending_clears_)
+        if (p.into == tex || p.t->res == tex || p.t->ms == tex) return FlushClear(*p.t);
+}
+
+void MetalBackend::FlushClears() {
+    while (!pending_clears_.empty()) FlushClear(*pending_clears_.front().t);
+}
+
+void MetalBackend::EncodeClear(Target& t, uint32_t flags, const float colour[4], float z, uint32_t stencil) {
+    EndEncoder();
+    MTLRenderPassDescriptor* d = [MTLRenderPassDescriptor renderPassDescriptor];
+    id<MTLTexture> into = t.ms ? t.ms : t.res;
     if (t.depth) {
         d.depthAttachment.texture = into;
         d.depthAttachment.loadAction = (flags & kClearZ) ? MTLLoadActionClear : MTLLoadActionLoad;
@@ -1809,6 +1899,7 @@ void MetalBackend::ClearWhole(Target& t, uint32_t flags, const float colour[4], 
 
 // a clear of part of a target: the full screen triangle in each rect
 void MetalBackend::ClearRects(Target& t, const std::vector<RECT>& rs, uint32_t flags, const float colour[4], float z, uint32_t stencil) {
+    FlushClear(t);
     PassFn f = PassFunctions(kClearHlsl, "vs", t.depth ? "psdepth" : "pscolour");
     id<MTLDepthStencilState> dss = no_depth_;
     if (t.depth) {
@@ -1933,6 +2024,7 @@ void MetalBackend::CopyByRegion(Target& src_t, Target& dst_t, uint32_t count, ui
 
 void MetalBackend::Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) {
     @autoreleasepool {
+        FlushClears();
         Target* src_t = FindTarget(src, false);
         // pixels the CPU made: the copy happens in memory, textures and targets pick it up from there
         if (!src_t || !src_t->drawn) {
@@ -1956,6 +2048,7 @@ void MetalBackend::Copy(const Surface& src, const Surface& dst, uint32_t count, 
 id<MTLTexture> MetalBackend::BindTargetTexture(const State& s, int stage, const TextureDesc& d, Target& t, DrawTextures& stages) {
     TexInfo& info = stages.info[stage];
     if (&t == draw_ds_) return nil;
+    FlushClear(t);
     stages.reads.rt[stage] = true;
     if (!t.depth && LatchCpuWrite(t)) {
         if (++reloads_[t.data] <= 3)
@@ -2770,8 +2863,8 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             std::memcpy(adjust.trace_turn, carried_->trace_turn, sizeof(adjust.trace_turn));
             std::memcpy(adjust.trace_range, carried_->trace_range, sizeof(adjust.trace_range));
             adjust.trace_self = carried_->trace_self;
-            adjust.raster_w = carried_->raster_w;
         }
+        if (g_draw_filtered && carried_) adjust.raster_w = carried_->raster_w;  // and its depth from the vertices
         if (g_draw_filter && !g_draw_filtered) g_draw_filter(s, adjust);
         if (adjust.skip) return;
         if (!g_draw_filtered) perf::CountDraw(prim, count);
@@ -2860,7 +2953,9 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         }();
         pk.wbuf = wbuffer && s.rs[kRsZEnable] == 2 && bound_ds_ ? 1 : 0;
         // DrawAdjust::raster_w: the vertex shader gives the W depth (hud[3] 2), the pixel shader writes none
-        const bool raster_w = pk.wbuf && adjust.raster_w;
+        // (not a draw with a slope polygon offset, decals: that part is the pixel shader's alone; a traced car keeps it as before)
+        const bool slope_offset = SimpleState(s, kMSolidOffsetEnable) && (SimpleState(s, kMSlopeScale) & 0x7FFFFFFF) != 0;
+        const bool raster_w = pk.wbuf && adjust.raster_w && (adjust.trace_reflect || !slope_offset);
         if (raster_w) pk.wbuf = 0;
         // alpha tested, not blended, onto twins: Settings::alpha_coverage (not quads, whose shader is rewritten)
         if (app::Get().alpha_coverage && bound_ms_ && !sh.quad && SimpleState(s, kMAlphaTestEnable) && !SimpleState(s, kMBlendEnable)) pk.coverage = msaa_;
@@ -2912,10 +3007,20 @@ void MetalBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         draw_counting_ = s.simple[kMCountEnable >> 2] != 0;
         if (draw_counting_ && run_) EndRun();
         if (ts_probe_ && perf::On() && enc_ && draw_2d_) EndEncoder();  // this draw alone in its encoder
+        if (!pending_clears_.empty()) {
+            // a bound target's clear made into the other of its twin and res is made first (as before: a pass of its own)
+            for (Target* t : {bound_rt_, bound_ds_})
+                if (t)
+                    for (const PendingClear& p : pending_clears_)
+                        if (p.t == t && p.into != (bound_ms_ ? t->ms : t->res)) {
+                            FlushClear(*t);
+                            break;
+                        }
+        }
         if (bound_ms_)
-            OpenPass(bound_rt_ ? bound_rt_->ms : nil, bound_ds_ ? bound_ds_->ms : nil, bound_rt_ ? bound_rt_->res : nil, bound_ds_ ? bound_ds_->res : nil);
+            OpenPass(bound_rt_ ? bound_rt_->ms : nil, bound_ds_ ? bound_ds_->ms : nil, bound_rt_ ? bound_rt_->res : nil, bound_ds_ ? bound_ds_->res : nil, true);
         else
-            OpenPass(bound_rt_ ? bound_rt_->res : nil, bound_ds_ ? bound_ds_->res : nil);
+            OpenPass(bound_rt_ ? bound_rt_->res : nil, bound_ds_ ? bound_ds_->res : nil, nil, nil, true);
         lap.Mark(perf::kStOpenPass);
         if (ts_cur_ >= 0) {
             EncoderInfo& e = ts_pass_[size_t(ts_cur_)];
@@ -3193,8 +3298,53 @@ void MetalBackend::CountFps() {
     }
 }
 
+// the frame to out_w x out_h by MetalFX's spatial scaler, or nil (smaller output, no MetalFX on this GPU, a scaler that failed)
+id<MTLTexture> MetalBackend::MetalFxUpscale(id<MTLTexture> frame, uint32_t out_w, uint32_t out_h) {
+    const uint32_t in_w = uint32_t(frame.width), in_h = uint32_t(frame.height);
+    if (fx_failed_ || out_w <= in_w || out_h <= in_h) return nil;
+    auto fits = [&](const FxScaler& f) { return f.scaler && f.in_w == in_w && f.in_h == in_h && f.out_w == out_w && f.out_h == out_h; };
+    if (!fits(fx_[0]) && fits(fx_[1])) std::swap(fx_[0], fx_[1]);
+    if (!fits(fx_[0])) {
+        if (![MTLFXSpatialScalerDescriptor supportsDevice:dev_]) {
+            fx_failed_ = true;
+            LOGR("metal: MetalFX: not on this GPU, frames scaled by the final pass");
+            return nil;
+        }
+        MTLFXSpatialScalerDescriptor* sd = [MTLFXSpatialScalerDescriptor new];
+        sd.inputWidth = in_w, sd.inputHeight = in_h, sd.outputWidth = out_w, sd.outputHeight = out_h;
+        sd.colorTextureFormat = frame.pixelFormat;
+        sd.outputTextureFormat = frame.pixelFormat;
+        sd.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;  // the frame is gamma encoded
+        FxScaler f;
+        f.scaler = [sd newSpatialScalerWithDevice:dev_];
+        if (!f.scaler || (frame.usage & f.scaler.colorTextureUsage) != f.scaler.colorTextureUsage) {
+            LOGR("metal: MetalFX: no scaler for %ux%u to %ux%u, frames scaled by the final pass", in_w, in_h, out_w, out_h);
+            fx_failed_ = true;
+            return nil;
+        }
+        MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:frame.pixelFormat width:out_w height:out_h mipmapped:NO];
+        td.storageMode = MTLStorageModePrivate;
+        td.usage = f.scaler.outputTextureUsage | MTLTextureUsageShaderRead;
+        f.out = [dev_ newTextureWithDescriptor:td];
+        if (!f.out) return nil;
+        f.in_w = in_w, f.in_h = in_h, f.out_w = out_w, f.out_h = out_h;
+        fx_[1] = std::move(fx_[0]);
+        fx_[0] = std::move(f);
+        LOGR("metal: MetalFX: frames %ux%u enlarged to %ux%u", in_w, in_h, out_w, out_h);
+    }
+    EndEncoder();
+    FxScaler& f = fx_[0];
+    f.scaler.colorTexture = frame;
+    f.scaler.outputTexture = f.out;
+    f.scaler.inputContentWidth = in_w;
+    f.scaler.inputContentHeight = in_h;
+    [f.scaler encodeToCommandBuffer:Cb()];
+    return f.out;
+}
+
 void MetalBackend::Present(const Surface& front) {
     @autoreleasepool {
+        FlushClears();
         Target* t = EnsureTarget(front, false);
         if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
         if (ramp_dirty_) UploadGammaRamp();
@@ -3219,6 +3369,13 @@ void MetalBackend::Present(const Surface& front) {
                 app::SaveScreenshot(std::move(px), tg.w, tg.h);
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));  // screenshots are named by the time
             }
+        }
+        if (drawable && frame && app::Get().scale_filter == 2) {
+            // where the frame lands in the drawable, as the pass below places it
+            const float w = float(drawable.texture.width), h = float(drawable.texture.height);
+            const float aspect = frame.height ? float(frame.width) / float(frame.height) : aspect_;
+            const float vw = std::min(w, h * aspect), vh = vw / aspect;
+            if (id<MTLTexture> up = MetalFxUpscale(frame, uint32_t(std::lround(vw)), uint32_t(std::lround(vh)))) frame = up;
         }
         if (drawable) {
             MTLRenderPassDescriptor* d = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -3377,6 +3534,7 @@ void MetalBackend::ApplySettings() {
     static const uint32_t kSamples[4] = {1, 2, 4, 8};
     const uint32_t want_ms = kSamples[std::min<uint32_t>(app::Get().msaa, 3)];
     if (want_ms != msaa_) {
+        FlushClears();
         EndEncoder();
         msaa_ = want_ms;
         for (auto& [key, t] : targets_) t.ms = nil, t.ms_stale = false;
@@ -3414,6 +3572,7 @@ void MetalBackend::ApplySettings() {
 // a new render scale or shape: colour targets keep their pictures, scaled into new ones (a title may draw a target once
 // and sample it for long after: PGR2's mini map), depth targets start again
 void MetalBackend::RescaleTargets() {
+    FlushClears();
     Unbind();
     for (auto it = targets_.begin(); it != targets_.end();) {
         Target& old = it->second;

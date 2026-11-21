@@ -149,7 +149,7 @@ function(add_xbe_image_mac target xbe config partitions game_dir)
     target_compile_options(${target} PRIVATE -fno-strict-aliasing -ffp-contract=off)
     target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus SDL3::SDL3-static
-        "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework CoreGraphics"
+        "-framework Metal" "-framework MetalFX" "-framework QuartzCore" "-framework Foundation" "-framework CoreGraphics"
         "-framework ImageIO" "-framework CoreServices" "-framework Cocoa")
 endfunction()
 

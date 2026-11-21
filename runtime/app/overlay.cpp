@@ -462,9 +462,15 @@ void Graphics(Settings& s) {
         s.smaa = edge == 2;
         Save();
     }
+#ifdef __APPLE__
+    int filter = int(s.scale_filter % 3);
+    const char* filter_names[] = {"Bilinear", "Sharp", "MetalFX"};
+    if (RowChoice("Scaling filter", &filter, filter_names, 3, "How the frame reaches the screen's size when it is drawn smaller. MetalFX enlarges it with Apple's upscaler: lower the render scale to gain frame rate.")) {
+#else
     int filter = int(s.scale_filter % 2);
     const char* filter_names[] = {"Bilinear", "Sharp"};
     if (RowChoice("Scaling filter", &filter, filter_names, 2, "How the frame reaches the screen's size when render scale is not 100%.")) {
+#endif
         s.scale_filter = uint32_t(filter);
         Save();
     }

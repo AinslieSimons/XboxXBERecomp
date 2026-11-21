@@ -30,7 +30,7 @@ namespace {
 using clock = std::chrono::steady_clock;
 
 const char* const kStageNames[kStageCount] = {"assemble", "targets", "shaders", "textures", "pipeline", "open_pass", "encoder_state", "constants", "texture_set", "geometry", "send_state"};
-const char* const kCountNames[kCountCount] = {"encoders", "blits", "command_buffers", "pipeline_binds", "texture_binds", "vertex_bytes", "index_bytes", "constant_uploads", "constant_bytes", "states_sent", "deltas", "delta_bytes", "merged_draws"};
+const char* const kCountNames[kCountCount] = {"encoders", "blits", "command_buffers", "pipeline_binds", "texture_binds", "vertex_bytes", "index_bytes", "constant_uploads", "constant_bytes", "states_sent", "deltas", "delta_bytes", "merged_draws", "clears_folded"};
 std::vector<std::string> g_zone_names;
 std::atomic<uint64_t> g_zone_ticks[kMaxZones], g_zone_calls[kMaxZones];
 std::atomic<int> g_core[2] = {-1, -1};

@@ -39,7 +39,7 @@ inline uint64_t Ticks() {
 enum Stage { kStAssemble, kStTargets, kStShaders, kStTextures, kStPipeline, kStOpenPass, kStEncoderState, kStConstants, kStTextureSet, kStGeometry, kStSendState, kStageCount };
 // things counted between presents
 enum Count { kNEncoders, kNBlits, kNCommandBuffers, kNPipelineBinds, kNTextureBinds, kNVertexBytes, kNIndexBytes, kNConstantUploads, kNConstantBytes,
-             kNStatesSent, kNDeltas, kNDeltaBytes, kNMerged, kCountCount };
+             kNStatesSent, kNDeltas, kNDeltaBytes, kNMerged, kNClearsFolded, kCountCount };
 extern std::atomic<uint64_t> g_stage[kStageCount], g_count[kCountCount];
 inline void Add(Count c, uint64_t n = 1) {
     if (On()) g_count[c].fetch_add(n, std::memory_order_relaxed);
